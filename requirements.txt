@@ -1,0 +1,6 @@
+# Install a CUDA-compatible PyTorch wheel separately; it supplies a matching Triton on Linux.
+torch>=2.6,<2.8
+triton>=3.2,<3.4
+numpy>=1.26
+pandas>=2.2
+matplotlib>=3.8

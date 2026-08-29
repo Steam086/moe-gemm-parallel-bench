@@ -1,0 +1,27 @@
+# Python environments and bytecode
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Test, lint, coverage, and benchmark caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.benchmarks/
+
+# Machine-specific benchmark artifacts
+results/**
+!results/.gitkeep
+plots/**
+!plots/.gitkeep
+
+# Local agent/editor scratch
+progress.md
+.idea/
+.vscode/
+.DS_Store
