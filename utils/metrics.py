@@ -46,6 +46,13 @@ def moe_shapes(
     experts: int,
     parallel_size: int,
 ) -> list[tuple[int, int, int]]:
+    """Build one rank's expert GEMMs after an assumed uniform routing step.
+
+    ``m`` is the number of top-k-expanded assignment rows per expert. Therefore
+    a TP rank represents ``experts * m`` input rows and an EP rank represents
+    ``experts * m / parallel_size`` rows. Routing and permutation are not part
+    of this shape-only construction.
+    """
     if experts % parallel_size:
         raise ValueError("num_experts must be divisible by parallel_size")
     if ffn % parallel_size:

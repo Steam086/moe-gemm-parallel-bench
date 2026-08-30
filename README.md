@@ -15,11 +15,26 @@ The project provides:
 
 ## Equal-FLOP comparison
 
-For uniform routing, each expert receives:
+The workload starts after a *logical* top-k expansion. The notation is:
 
 ```text
-M_e = tokens * topk / num_experts
+T   = original tokens before routing
+X   = T * topk expert-assignment rows after top-k expansion
+E   = num_experts
+P   = parallel_size
+M_e = X / E = T * topk / E rows per expert under uniform routing
 ```
+
+If an input is described as `[x,H]` in this benchmark, `x` means `X`, the number of top-k-expanded expert-assignment rows, not the original token count `T`. Consequently, one TP rank processes `X` rows distributed uniformly across all `E` experts, while one EP rank processes `X/P` rows distributed uniformly across its `E/P` local experts. Both cases therefore use the same `M_e=X/E` rows per expert:
+
+```text
+TP rank: E   expert inputs * M_e rows = X rows
+EP rank: E/P expert inputs * M_e rows = X/P rows
+```
+
+There is currently no router implementation. The benchmark does not compute routing scores, select experts, construct routing indices, or perform token permutation. Instead, it assumes perfectly uniform routing and directly allocates already partitioned `[M_e,K]` input matrices for each expert. These separate matrices are the compute-only equivalent of slicing an expert-sorted aggregate input; routing imbalance and the cost of producing that layout are outside the timed region and outside the current scope.
+
+`--tokens` specifies the original pre-routing count `T`; the benchmark derives `X=T*topk` and `M_e=X/E`. `--moe-ms` specifies `M_e` directly and derives an integral `T=M_e*E/topk` for provenance.
 
 For W1:
 

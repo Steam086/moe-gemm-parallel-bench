@@ -56,7 +56,11 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--topk", type=int)
     p.add_argument("--hidden-size", type=int)
     p.add_argument("--ffn-size", type=int)
-    p.add_argument("--tokens", type=int, help="Run one MoE M derived from T*topk/E instead of the M sweep")
+    p.add_argument(
+        "--tokens",
+        type=int,
+        help="Original pre-routing token count T; run one MoE M derived from T*topk/E instead of the M sweep",
+    )
     p.add_argument("--moe-ms", type=int_list, help="Comma-separated tokens-per-expert sweep")
     p.add_argument("--warmup", type=int, default=25)
     p.add_argument("--repeat", type=int, default=100)

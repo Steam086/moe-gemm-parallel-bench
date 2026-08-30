@@ -1,4 +1,8 @@
-"""Experiment B: fair per-rank EP versus TP expert GEMM workloads."""
+"""Fair per-rank EP versus TP GEMMs over uniform top-k-expanded assignments.
+
+No router or token permutation is executed. Inputs are materialized directly as
+expert-partitioned matrices with M = original_tokens * topk / num_experts.
+"""
 
 from __future__ import annotations
 
