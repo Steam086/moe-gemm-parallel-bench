@@ -7,7 +7,7 @@ try:
 except ImportError:
     torch = None
 
-from kernels.grouped_gemm import build_grouped_workspace, launch_grouped
+from kernels.grouped_gemm import build_fused_gate_up_workspace, build_grouped_workspace, launch_grouped
 from kernels.matmul import last_matmul_config, launch_matmul, select_config
 from utils.benchmark import assert_close
 
@@ -74,6 +74,20 @@ class TritonCorrectnessTests(unittest.TestCase):
         self.assertEqual(workspace.scheduler, "homogeneous_persistent")
         for a, b, c in zip(workspace.a, workspace.b, workspace.c):
             assert_close(c, a @ b, "fp16")
+
+    def test_fused_gate_up_packed_output_in_one_grouped_launch(self) -> None:
+        local_ffn = 31
+        workspace = build_fused_gate_up_workspace([(17, 13, 2 * local_ffn)] * 3, torch.float16, seed=102)
+        self.assertEqual(workspace.operation, "gate_up")
+        launch_grouped(workspace)
+        torch.cuda.synchronize()
+        self.assertEqual(workspace.scheduler, "homogeneous_persistent")
+        for a, packed_weight, packed_output in zip(workspace.a, workspace.b, workspace.c):
+            reference = torch.cat(
+                (a @ packed_weight[:, :local_ffn], a @ packed_weight[:, local_ffn:]),
+                dim=1,
+            )
+            assert_close(packed_output, reference, "fp16")
 
     def test_one_problem_group_dispatches_standard_matmul(self) -> None:
         workspace = build_grouped_workspace([(17, 70, 65)], torch.float16, seed=103)

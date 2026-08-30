@@ -2,6 +2,7 @@
 
 from .grouped_gemm import (
     GroupedWorkspace,
+    build_fused_gate_up_workspace,
     build_grouped_workspace,
     grouped_candidate_configs,
     launch_grouped,
@@ -17,6 +18,7 @@ from .matmul import (
 __all__ = [
     "GroupedWorkspace",
     "KernelConfig",
+    "build_fused_gate_up_workspace",
     "build_grouped_workspace",
     "grouped_candidate_configs",
     "last_matmul_config",

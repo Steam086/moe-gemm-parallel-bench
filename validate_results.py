@@ -23,6 +23,10 @@ def _truthy(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes"}
 
 
+def _falsey(value: str) -> bool:
+    return value.strip().lower() in {"0", "false", "no"}
+
+
 def _finite_positive(value: str) -> bool:
     try:
         number = float(value)
@@ -82,6 +86,27 @@ def _derivable_metrics_valid(row: dict[str, str]) -> bool:
     )
 
 
+def _projection_contract_valid(row: dict[str, str], filename: str) -> bool:
+    """Verify persisted W13 Gate+Up and W2 Down semantics."""
+    if filename == "moe_w1.csv":
+        return (
+            row.get("projection") == "W1"
+            and row.get("operation") == "gate_up"
+            and row.get("fused_projections") == "2"
+            and row.get("output_layout") == "gate_then_up"
+            and _falsey(row.get("activation_in_timed_region", ""))
+        )
+    if filename == "moe_w2.csv":
+        return (
+            row.get("projection") == "W2"
+            and row.get("operation") == "down"
+            and row.get("fused_projections") == "1"
+            and row.get("output_layout") == "down"
+            and _falsey(row.get("activation_in_timed_region", ""))
+        )
+    return True
+
+
 def _matched_moe_flops_equal(rows: list[dict[str, str]]) -> bool:
     totals: dict[tuple[str, ...], dict[str, int]] = {}
     fields = (
@@ -133,6 +158,7 @@ def validate_results(results_dir: str | Path = "results", plots_dir: str | Path 
     if not run_id:
         report["issues"].append("environment.json has no run_id")
     any_ok = False
+    ok_files: set[str] = set()
     for group in sorted(selected):
         for filename in files[group]:
             rows = _read_current_rows(results / filename, run_id)
@@ -147,6 +173,7 @@ def validate_results(results_dir: str | Path = "results", plots_dir: str | Path 
             )
             correctness_ok = all(_truthy(row.get("correct", "")) for row in ok_rows)
             metrics_ok = all(_derivable_metrics_valid(row) for row in ok_rows)
+            projection_ok = all(_projection_contract_valid(row, filename) for row in ok_rows)
             flops_ok = all(
                 filename not in {"moe_w1.csv", "moe_w2.csv"} or _truthy(row.get("flops_equal", "")) for row in ok_rows
             ) and (filename not in {"moe_w1.csv", "moe_w2.csv"} or _matched_moe_flops_equal(ok_rows))
@@ -161,16 +188,19 @@ def validate_results(results_dir: str | Path = "results", plots_dir: str | Path 
                 "all_correct": correctness_ok,
                 "positive_finite_metrics": numeric_ok,
                 "derivable_metrics_recomputed": metrics_ok,
+                "projection_contract": projection_ok,
                 "flops_equal": flops_ok,
                 "execution_contract": execution_ok,
             }
             report["files"][filename] = entry
             any_ok = any_ok or bool(ok_rows)
+            if ok_rows:
+                ok_files.add(filename)
             if not rows:
                 report["issues"].append(f"{filename}: no rows for run_id={run_id}")
             if bad:
                 report["issues"].append(f"{filename}: {len(bad)} invalid/error rows")
-            if not numeric_ok or not metrics_ok or not correctness_ok or not flops_ok or not execution_ok:
+            if not numeric_ok or not metrics_ok or not projection_ok or not correctness_ok or not flops_ok or not execution_ok:
                 report["issues"].append(f"{filename}: failed numeric/correctness/FLOP/execution checks")
 
     plot_files = sorted(plots.glob("figure_*.png"))
@@ -185,7 +215,15 @@ def validate_results(results_dir: str | Path = "results", plots_dir: str | Path 
                 signatures_ok = False
                 report["issues"].append(f"invalid plot artifact: {path}")
         if any_ok:
-            expected_plot_count = sum({"shapes": 3, "moe": 6, "heatmap": 2}[item] for item in selected)
+            expected_plot_count = sum(
+                {
+                    "gemm_shape_sweep.csv": 3,
+                    "moe_w1.csv": 3,
+                    "moe_w2.csv": 3,
+                    "gemm_heatmap.csv": 2,
+                }[filename]
+                for filename in ok_files
+            )
             if len(plot_files) != expected_plot_count:
                 report["issues"].append(f"expected {expected_plot_count} current plot files, found {len(plot_files)}")
     report["plots"] = {

@@ -6,7 +6,7 @@ The project provides:
 
 - a masked Triton single-GEMM kernel;
 - a one-launch persistent grouped-GEMM kernel over distinct expert pointers;
-- equal-FLOP EP/TP workload construction for W1 and W2 projections;
+- equal-FLOP EP/TP workload construction for packed W1/W3 Gate+Up and W2 Down projections;
 - PyTorch `torch.mm` baselines under the same FP32/TF32 policy;
 - hot and rotating-cold workspace regimes;
 - CSV provenance, plots, summaries, and offline result validation.
@@ -36,21 +36,28 @@ There is currently no router implementation. The benchmark does not compute rout
 
 `--tokens` specifies the original pre-routing count `T`; the benchmark derives `X=T*topk` and `M_e=X/E`. `--moe-ms` specifies `M_e` directly and derives an integral `T=M_e*E/topk` for provenance.
 
-For W1:
+For the fused W1/W3 Gate+Up projection, `F_local` is `F` under EP and `F/P`
+under TP. Gate and Up weights are packed along the output dimension in vLLM's
+W13 order, so one grouped Triton launch produces `[gate_local, up_local]`:
 
 ```text
-EP rank: num_experts/P GEMMs of [M_e,H] @ [H,F]
-TP rank: num_experts   GEMMs of [M_e,H] @ [H,F/P]
+EP rank: num_experts/P GEMMs of [M_e,H] @ [H,2F]
+TP rank: num_experts   GEMMs of [M_e,H] @ [H,2F/P]
 ```
 
-For W2:
+For W2 Down:
 
 ```text
 EP rank: num_experts/P GEMMs of [M_e,F]   @ [F,H]
 TP rank: num_experts   GEMMs of [M_e,F/P] @ [F/P,H]
 ```
 
-The benchmark rejects non-divisible configurations and verifies exact per-rank FLOP equality before allocating GPU memory.
+The Gate+Up timing covers the fused packed GEMM only. The following SiLU and
+elementwise `SiLU(gate) * up` are deliberately outside the timed region, as
+are routing and communication. The benchmark rejects non-divisible
+configurations and verifies exact per-rank FLOP equality before allocating GPU
+memory. W1/W3 therefore records twice the useful GEMM FLOPs of W2 for matching
+`M_e`, `H`, and `F`.
 
 ## Requirements
 
@@ -133,7 +140,7 @@ External absolute paths are accepted, but persisted provenance stores only a saf
 
 ### Scheduling modes
 
-- `grouped`: the MoE Triton provider launches one bounded persistent CTA grid for all local expert GEMMs. Equal contiguous shapes use an optimized constexpr fast path; heterogeneous shapes use device-side dimensions and strides. A one-problem group dispatches to the standard Triton matmul kernel instead of retaining grouped-scheduler overhead.
+- `grouped`: the MoE Triton provider launches one bounded persistent CTA grid for all local expert GEMMs. W1/W3 packs Gate and Up into a single `2F_local` output and therefore remains one Triton launch, matching vLLM's W13 layout. Equal contiguous shapes use an optimized constexpr fast path; heterogeneous shapes use device-side dimensions and strides. A one-problem group dispatches to the standard Triton matmul kernel instead of retaining grouped-scheduler overhead.
 - `torch`: sequential `torch.mm` baseline, enabled by default and removable with `--no-torch-baseline`.
 
 The standalone shape and heatmap experiments still use the single-GEMM Triton kernel; it is not emitted as a MoE scheduling curve.
@@ -182,14 +189,18 @@ python plot_results.py --results-dir results --plots-dir plots
 python validate_results.py --results-dir results --plots-dir plots
 ```
 
-Validation recomputes derivable FLOPs and TFLOPS, checks correctness/status fields, verifies matched MoE FLOPs, requires every successful Triton MoE row to record a selected workload-aware grouped configuration and supported scheduler, rejects the removed MoE `single` mode, and checks generated PNG signatures/counts.
+Validation recomputes derivable FLOPs and TFLOPS, checks the packed Gate+Up and
+Down projection contracts, verifies correctness/status fields and matched MoE
+FLOPs, requires every successful Triton MoE row to record a selected
+workload-aware grouped configuration and supported scheduler, rejects the
+removed MoE `single` mode, and checks generated PNG signatures/counts.
 
 ## Parallel-size sweeps
 
 Write each run to a separate directory:
 
 ```bash
-for p in 2 4 8 16; do
+for p in 2 4 8 16 32; do
   python benchmark.py --experiment moe --parallel-size "$p" \
     --results-dir "results/parallel_sweep/p$p" \
     --plots-dir "plots/parallel_sweep/p$p"
@@ -203,10 +214,15 @@ python plot_parallel_sweep.py \
   --run 2=results/parallel_sweep/p2 \
   --run 4=results/parallel_sweep/p4 \
   --run 8=results/parallel_sweep/p8 \
-  --run 16=results/parallel_sweep/p16
+  --run 16=results/parallel_sweep/p16 \
+  --run 32=results/parallel_sweep/p32
 ```
 
-The aggregator verifies common model, dtype, cache, timing, software, and hardware controls before generating its CSV, summary, validation report, and six scaling plots. Labels and summaries are derived from source provenance rather than hard-coded to a model or GPU.
+The aggregator verifies common model, dtype, cache, timing, software, and
+hardware controls before generating its CSV, summary, validation report, and
+six scaling plots. The summary includes exact TP Gate+Up, Down, and combined
+GEMM latency for every matched `(P, M_e)` point. Labels and summaries are
+derived from source provenance rather than hard-coded to a model or GPU.
 
 ## Metrics
 

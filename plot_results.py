@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 MOE_MODES = {"grouped", "torch"}
+PROJECTION_LABELS = {"W1": "W1/W3 Gate+Up", "W2": "W2 Down"}
 
 
 def _supported_moe_modes(frame):
@@ -86,7 +87,7 @@ def _moe_curves(frame, plots: Path, projection: str, model_name: str) -> None:
     ax.set_xscale("log", base=2)
     ax.set_xlabel("tokens per expert M_e")
     ax.set_ylabel("TFLOPS")
-    ax.set_title(f"{model_name} MoE {projection}: EP vs TP compute-only")
+    ax.set_title(f"{model_name} MoE {PROJECTION_LABELS[projection]}: EP vs TP compute-only")
     ax.grid(alpha=0.3)
     ax.legend()
     _save(fig, plots, f"figure_{'4' if projection == 'W1' else '6'}_moe_{projection.lower()}_tflops")
@@ -131,7 +132,10 @@ def _ratio_plot(frame, plots: Path, projection: str, model_name: str, latency: b
     ax.set_xscale("log", base=2)
     ax.set_xlabel("tokens per expert M_e")
     ax.set_ylabel("TP latency / EP latency" if latency else "TP TFLOPS / EP TFLOPS")
-    ax.set_title(f"{model_name} MoE {projection} TP/EP {'latency' if latency else 'performance'} ratio")
+    ax.set_title(
+        f"{model_name} MoE {PROJECTION_LABELS[projection]} TP/EP "
+        f"{'latency' if latency else 'performance'} ratio"
+    )
     ax.grid(alpha=0.3)
     ax.legend()
     number = "8" if latency else ("5" if projection == "W1" else "7")
@@ -201,11 +205,12 @@ def generate_summary(results: Path, run_id: str | None = None, model_name: str =
         lines += ["## Fixed-MNK shape sweep", "", "No valid GPU rows were recorded.", ""]
     lines += ["## MoE EP versus TP (equal useful FLOPs per rank)", ""]
     for projection, frame in (("W1", w1), ("W2", w2)):
+        projection_label = PROJECTION_LABELS[projection]
         if frame.empty:
-            lines += [f"### {projection}", "", "No valid matched GPU rows were recorded.", ""]
+            lines += [f"### {projection_label}", "", "No valid matched GPU rows were recorded.", ""]
             continue
         ratio = _ratio(frame, "tflops")
-        lines += [f"### {projection}", ""]
+        lines += [f"### {projection_label}", ""]
         for mode in ("grouped", "torch"):
             part = ratio[ratio["mode"] == mode]
             if part.empty:
@@ -260,7 +265,11 @@ def generate_summary(results: Path, run_id: str | None = None, model_name: str =
         grouped_frame = frame[frame["mode"] == "grouped"]
         if len(grouped_frame) >= 3:
             correlations.append(
-                f"{projection}: corr(TFLOPS, AI)={grouped_frame.tflops.corr(grouped_frame.arithmetic_intensity):.3f}, corr(TFLOPS, output tiles)={grouped_frame.tflops.corr(grouped_frame.total_output_tiles_per_rank):.3f}, corr(TFLOPS, waves)={grouped_frame.tflops.corr(grouped_frame.estimated_waves):.3f}"
+                f"{PROJECTION_LABELS[projection]}: corr(TFLOPS, AI)="
+                f"{grouped_frame.tflops.corr(grouped_frame.arithmetic_intensity):.3f}, "
+                f"corr(TFLOPS, output tiles)="
+                f"{grouped_frame.tflops.corr(grouped_frame.total_output_tiles_per_rank):.3f}, "
+                f"corr(TFLOPS, waves)={grouped_frame.tflops.corr(grouped_frame.estimated_waves):.3f}"
             )
     lines += [
         "## Interpretation",
@@ -273,7 +282,7 @@ def generate_summary(results: Path, run_id: str | None = None, model_name: str =
         "",
         "## Scope and caveats",
         "",
-        f"Only GEMM compute is timed. Routing, permutation, All-to-All, AllReduce/ReduceScatter, and network communication are excluded. Rotating-cold buffers reduce reuse but do not prove every access misses L2. Arithmetic intensity is an ideal one-read/one-write model, not measured HBM traffic. {model_name} dimensions are used with synthetic dense FP16/BF16/FP32 data; deployed quantization is not emulated.",
+        f"Only GEMM compute is timed. W1 is one packed W13 Gate+Up launch with [gate,up] output; SiLU and the elementwise multiply are excluded. Routing, permutation, All-to-All, AllReduce/ReduceScatter, and network communication are excluded. Rotating-cold buffers reduce reuse but do not prove every access misses L2. Arithmetic intensity is an ideal one-read/one-write model, not measured HBM traffic. {model_name} dimensions are used with synthetic dense FP16/BF16/FP32 data; deployed quantization is not emulated.",
         "",
     ]
     path = results / "summary.md"

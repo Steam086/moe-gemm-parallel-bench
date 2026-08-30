@@ -3,7 +3,9 @@
 Equal, contiguous MoE problems use a constexpr-shape fast path. Arbitrary
 shape/stride groups use a device-side scheduled fallback with a per-problem K
 loop, so a short-K problem never executes dot operations up to the group's
-maximum K.
+maximum K.  Gate+Up uses the same kernel with a packed W13 output dimension:
+the first N/2 columns are Gate and the second N/2 columns are Up, matching the
+layout used by vLLM's Triton FusedMoE path.
 """
 
 from __future__ import annotations
@@ -65,6 +67,7 @@ class GroupedWorkspace:
     sm_count: int
     storage_bytes: int
     homogeneous: bool
+    operation: str = "gemm"
     scheduler: str = "not_launched"
 
     @property
@@ -578,6 +581,28 @@ def build_grouped_workspace(
         storage_bytes,
         homogeneous,
     )
+
+
+def build_fused_gate_up_workspace(
+    shapes: Sequence[tuple[int, int, int]],
+    dtype,
+    seed: int = 0,
+    config: KernelConfig | None = None,
+) -> GroupedWorkspace:
+    """Build packed W13 problems for a one-launch Gate+Up grouped GEMM.
+
+    Every problem's output dimension is ``2 * local_ffn`` and is laid out as
+    ``[gate, up]``.  Packing is represented directly by one contiguous B and C
+    matrix per expert rather than by two kernel launches.  SiLU and the
+    elementwise Gate/Up multiply intentionally remain outside this compute-only
+    GEMM benchmark.
+    """
+    normalized = tuple(tuple(int(value) for value in shape) for shape in shapes)
+    if any(len(shape) != 3 or shape[2] % 2 for shape in normalized):
+        raise ValueError("fused Gate+Up shapes require an even packed output dimension")
+    workspace = build_grouped_workspace(normalized, dtype, seed, config)
+    workspace.operation = "gate_up"
+    return workspace
 
 
 def _grid_size(workspace: GroupedWorkspace, config: KernelConfig) -> int:

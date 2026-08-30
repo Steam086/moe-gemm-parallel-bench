@@ -10,6 +10,7 @@ import json
 from typing import Any
 
 from kernels.grouped_gemm import (
+    build_fused_gate_up_workspace,
     build_grouped_workspace,
     grouped_candidate_configs,
     launch_grouped,
@@ -41,8 +42,9 @@ def _base(args, env, projection: str, parallel_type: str, mode: str, m: int, sha
     metrics = tile_metrics([shape] * count, cfg.block_m, cfg.block_n, cfg.block_k, int(env.get("sm_count") or 0))
     tokens = m * args.num_experts // args.topk
     provider = "torch" if mode == "torch" else "triton"
+    operation = "gate_up" if projection == "W1" else "down"
     row = {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "run_id": args.run_id,
         "timestamp": args.timestamp,
         "gpu_name": env.get("gpu_name"),
@@ -52,6 +54,10 @@ def _base(args, env, projection: str, parallel_type: str, mode: str, m: int, sha
         "dtype": args.dtype,
         "experiment": "moe",
         "projection": projection,
+        "operation": operation,
+        "fused_projections": 2 if projection == "W1" else 1,
+        "output_layout": "gate_then_up" if projection == "W1" else "down",
+        "activation_in_timed_region": False,
         "mode": mode,
         "provider": provider,
         "parallel_type": parallel_type,
@@ -139,8 +145,9 @@ def _run_case(args, env: dict[str, Any], projection: str, parallel_type: str, mo
     # Retry allocator failures with fewer rotating buffers; never alter GEMM shapes.
     while ring >= minimum_ring:
         try:
+            build_workspace = build_fused_gate_up_workspace if projection == "W1" else build_grouped_workspace
             workspaces = [
-                build_grouped_workspace(shapes, dtype, args.seed + index * 100003, cfg) for index in range(ring)
+                build_workspace(shapes, dtype, args.seed + index * 100003, cfg) for index in range(ring)
             ]
             break
         except torch.OutOfMemoryError:
@@ -201,7 +208,13 @@ def _run_case(args, env: dict[str, Any], projection: str, parallel_type: str, mo
         max_rel = 0.0
         for workspace in workspaces:
             for a, b, c in zip(workspace.a, workspace.b, workspace.c):
-                reference = torch.matmul(a, b)
+                if projection == "W1":
+                    local_ffn = b.shape[1] // 2
+                    reference = torch.cat(
+                        (torch.matmul(a, b[:, :local_ffn]), torch.matmul(a, b[:, local_ffn:])), dim=1
+                    )
+                else:
+                    reference = torch.matmul(a, b)
                 abs_error, rel_error = assert_close(c, reference, args.dtype)
                 max_abs = max(max_abs, abs_error)
                 max_rel = max(max_rel, rel_error)

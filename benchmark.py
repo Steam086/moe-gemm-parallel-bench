@@ -97,7 +97,7 @@ def parser() -> argparse.ArgumentParser:
 
 def _unsupported_row(args, env: dict[str, Any], experiment: str, reason: str, projection: str = "") -> dict[str, Any]:
     return {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "run_id": args.run_id,
         "timestamp": args.timestamp,
         "gpu_name": env.get("gpu_name"),
@@ -107,6 +107,10 @@ def _unsupported_row(args, env: dict[str, Any], experiment: str, reason: str, pr
         "dtype": args.dtype,
         "experiment": experiment,
         "projection": projection,
+        "operation": "gate_up" if projection == "W1" else "down" if projection == "W2" else "",
+        "fused_projections": 2 if projection == "W1" else 1 if projection == "W2" else "",
+        "output_layout": "gate_then_up" if projection == "W1" else "down" if projection == "W2" else "",
+        "activation_in_timed_region": False if projection else "",
         "parallel_size": args.parallel_size,
         "num_experts": args.num_experts,
         "topk": args.topk,
@@ -126,7 +130,8 @@ def _print_moe_table(rows: list[dict[str, Any]], projection: str) -> None:
     for row in rows:
         if row.get("mode") == "grouped" and row.get("status") == "ok":
             paired.setdefault(int(row["M"]), {})[str(row["parallel_type"])] = row
-    print(f"\n{projection} Grouped GEMM")
+    label = "W1/W3 Gate+Up" if projection == "W1" else "W2 Down"
+    print(f"\n{label} Grouped GEMM")
     print("| M_e | EP TFLOPS | TP TFLOPS | TP/EP | EP ms | TP ms |")
     print("|---:|---:|---:|---:|---:|---:|")
     for m, values in sorted(paired.items()):
@@ -207,6 +212,7 @@ def main(argv: list[str] | None = None) -> int:
         "triton_autotune": True,
         "standalone_gemm_autotune_scope": "shape-family BLOCK_M/BLOCK_N/BLOCK_K/GROUP_M/num_warps/num_stages",
         "grouped_autotune_scope": "workload-aware BLOCK_M/BLOCK_N/BLOCK_K/GROUP_M/CTA multiplier/num_warps/num_stages",
+        "w1_semantics": "one-launch packed W13 Gate+Up GEMM with [gate,up] output; activation excluded",
         "cold_autotune": "fixed candidates timed across the complete rotating workspace ring",
         "near_best_threshold": 0.90,
         "plot_format": "png",

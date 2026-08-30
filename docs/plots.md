@@ -15,11 +15,11 @@ A complete run can generate:
 1. fixed-FLOP shape throughput;
 2. fixed-FLOP normalized efficiency;
 3. ideal arithmetic intensity;
-4. W1 EP/TP throughput;
-5. W1 TP/EP throughput ratio;
-6. W2 EP/TP throughput;
-7. W2 TP/EP throughput ratio;
-8. W1 and W2 TP/EP latency ratios;
+4. packed W1/W3 Gate+Up EP/TP throughput;
+5. packed W1/W3 Gate+Up TP/EP throughput ratio;
+6. W2 Down EP/TP throughput;
+7. W2 Down TP/EP throughput ratio;
+8. Gate+Up and Down TP/EP latency ratios;
 9. raw and normalized GEMM heatmaps.
 
 Only figures supported by current-run CSV rows are emitted. Selective reruns remove stale root figures before plotting.
@@ -82,6 +82,9 @@ python plot_parallel_sweep.py \
 ```
 
 The aggregate includes skipped rows in its CSV but does not interpolate them in plots. Read each recorded `skip_reason` instead of assuming a particular GPU-memory cause.
+Its generated summary also records the exact grouped TP Gate+Up, Down, and
+combined GEMM latency at every matched `(P, M_e)` point. Gate+Up is one packed
+W13 GEMM launch; the SiLU×Up activation is not part of that timing.
 
 ## Reporting results
 

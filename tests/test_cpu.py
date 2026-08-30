@@ -14,7 +14,7 @@ from plot_parallel_sweep import parse_run_spec
 from utils.config import load_model_defaults
 from utils.io import CSV_FIELDS
 from utils.metrics import arithmetic_intensity, gemm_flops, moe_shapes, tile_metrics, verify_ep_tp_flops
-from validate_results import _derivable_metrics_valid, _moe_execution_contract_valid
+from validate_results import _derivable_metrics_valid, _moe_execution_contract_valid, _projection_contract_valid
 
 
 class CpuMathTests(unittest.TestCase):
@@ -53,10 +53,13 @@ class CpuMathTests(unittest.TestCase):
             tp = sum(gemm_flops(*x) for x in moe_shapes(projection, "TP", 17, 7168, 2048, 256, 8))
             self.assertEqual(total, ep)
             self.assertEqual(ep, tp)
+        w1 = verify_ep_tp_flops("W1", 17, 7168, 2048, 256, 8)
+        w2 = verify_ep_tp_flops("W2", 17, 7168, 2048, 256, 8)
+        self.assertEqual(w1, 2 * w2)
 
     def test_ep_tp_shapes_split_the_intended_dimension(self) -> None:
-        self.assertEqual(moe_shapes("W1", "EP", 17, 7168, 2048, 256, 8), [(17, 7168, 2048)] * 32)
-        self.assertEqual(moe_shapes("W1", "TP", 17, 7168, 2048, 256, 8), [(17, 7168, 256)] * 256)
+        self.assertEqual(moe_shapes("W1", "EP", 17, 7168, 2048, 256, 8), [(17, 7168, 4096)] * 32)
+        self.assertEqual(moe_shapes("W1", "TP", 17, 7168, 2048, 256, 8), [(17, 7168, 512)] * 256)
         self.assertEqual(moe_shapes("W2", "EP", 17, 7168, 2048, 256, 8), [(17, 2048, 7168)] * 32)
         self.assertEqual(moe_shapes("W2", "TP", 17, 7168, 2048, 256, 8), [(17, 256, 7168)] * 256)
 
@@ -118,6 +121,10 @@ class CpuMathTests(unittest.TestCase):
         self.assertTrue(parser().parse_args([]).torch_baseline)
         self.assertFalse(parser().parse_args(["--no-torch-baseline"]).torch_baseline)
         for field in (
+            "operation",
+            "fused_projections",
+            "output_layout",
+            "activation_in_timed_region",
             "scheduler",
             "cta_multiplier",
             "best_measured_ratio",
@@ -165,6 +172,25 @@ class CpuMathTests(unittest.TestCase):
         self.assertTrue(_moe_execution_contract_valid(grouped))
         self.assertFalse(_moe_execution_contract_valid({**grouped, "mode": "single"}))
         self.assertFalse(_moe_execution_contract_valid({**grouped, "autotune_status": "not_run"}))
+
+    def test_projection_contract_records_gate_up_fusion(self) -> None:
+        gate_up = {
+            "projection": "W1",
+            "operation": "gate_up",
+            "fused_projections": "2",
+            "output_layout": "gate_then_up",
+            "activation_in_timed_region": "False",
+        }
+        down = {
+            "projection": "W2",
+            "operation": "down",
+            "fused_projections": "1",
+            "output_layout": "down",
+            "activation_in_timed_region": "False",
+        }
+        self.assertTrue(_projection_contract_valid(gate_up, "moe_w1.csv"))
+        self.assertTrue(_projection_contract_valid(down, "moe_w2.csv"))
+        self.assertFalse(_projection_contract_valid({**gate_up, "fused_projections": "1"}, "moe_w1.csv"))
 
     def test_parallel_sweep_run_spec(self) -> None:
         size, path = parse_run_spec("16=results/custom-p16")

@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 MOE_MODES = {"grouped", "torch"}
+PROJECTION_LABELS = {"W1": "W1/W3 Gate+Up", "W2": "W2 Down"}
 
 CONSISTENT_EFFECTIVE_PARAMETERS = (
     "hidden_size",
@@ -271,7 +272,7 @@ def _absolute_plot(ok, output: Path, projection: str, value: str, model_name: st
         ax.set_yscale("log", base=2)
     ylabel = "TFLOPS" if value == "tflops" else "latency (ms)"
     axes[0].set_ylabel(ylabel)
-    fig.suptitle(f"{model_name} MoE {projection}: grouped {ylabel} across parallel sizes")
+    fig.suptitle(f"{model_name} MoE {PROJECTION_LABELS[projection]}: grouped {ylabel} across parallel sizes")
     _legend(fig, axes)
     suffix = "tflops" if value == "tflops" else "latency"
     number = {("W1", "tflops"): 1, ("W2", "tflops"): 2, ("W1", "latency_ms"): 5, ("W2", "latency_ms"): 6}[
@@ -311,13 +312,15 @@ def _ratio_plot(paired, output: Path, projection: str, model_name: str) -> Path 
         ax.set_title(mode)
         _format_parallel_axis(ax, sizes)
     axes[0].set_ylabel("TP TFLOPS / EP TFLOPS")
-    fig.suptitle(f"{model_name} MoE {projection}: equal-FLOP TP/EP ratio across parallel sizes")
+    fig.suptitle(
+        f"{model_name} MoE {PROJECTION_LABELS[projection]}: equal-FLOP TP/EP ratio across parallel sizes"
+    )
     _legend(fig, axes)
     number = 3 if projection == "W1" else 4
     return _save(fig, output, f"figure_parallel_{number}_{projection.lower()}_tp_ep_ratio")
 
 
-def _summary(path: Path, sources: dict[int, dict], paired, model_name: str, parameters: dict) -> None:
+def _summary(path: Path, sources: dict[int, dict], paired, combined, model_name: str, parameters: dict) -> None:
     controls = ", ".join(
         f"{key}={parameters.get(key)}"
         for key in ("dtype", "cache_mode", "num_experts", "topk", "hidden_size", "ffn_size")
@@ -349,8 +352,41 @@ def _summary(path: Path, sources: dict[int, dict], paired, model_name: str, para
     for (projection, size), part in grouped.groupby(["projection", "parallel_size"], sort=True):
         worst = part.loc[part.tflops_ratio.idxmin()]
         lines.append(
-            f"| {projection} | {int(size)} | {len(part)} | {part.tflops_ratio.min():.3f} | "
+            f"| {PROJECTION_LABELS.get(projection, projection)} | {int(size)} | {len(part)} | "
+            f"{part.tflops_ratio.min():.3f} | "
             f"{part.tflops_ratio.median():.3f} | {part.tflops_ratio.max():.3f} | {int(worst.M)} |"
+        )
+    grouped_tp = combined[(combined["mode"] == "grouped") & (combined.parallel_type == "TP")].copy()
+    gate_up = grouped_tp[grouped_tp.projection == "W1"]
+    down = grouped_tp[grouped_tp.projection == "W2"]
+    latency = gate_up.merge(
+        down,
+        on=["parallel_size", "M", "mode", "parallel_type"],
+        how="outer",
+        suffixes=("_gate_up", "_down"),
+        validate="one_to_one",
+    )
+    lines += [
+        "",
+        "## TP grouped-kernel projection latency",
+        "",
+        "Gate+Up is one packed W13 Triton launch. Combined time is the sum of the two compute-only launches; "
+        "SiLU×Up and communication are not included.",
+        "",
+        "| P | M_e | Gate+Up ms/status | Down ms/status | combined GEMM ms |",
+        "|---:|---:|---:|---:|---:|",
+    ]
+    for _, row in latency.sort_values(["parallel_size", "M"]).iterrows():
+        gate_up_ok = str(row.status_gate_up) == "ok"
+        down_ok = str(row.status_down) == "ok"
+        gate_up_ms = float(row.latency_ms_gate_up) if gate_up_ok else None
+        down_ms = float(row.latency_ms_down) if down_ok else None
+        gate_up_display = f"{gate_up_ms:.4f}" if gate_up_ms is not None else "skipped"
+        down_display = f"{down_ms:.4f}" if down_ms is not None else "skipped"
+        combined_display = f"{gate_up_ms + down_ms:.4f}" if gate_up_ms is not None and down_ms is not None else "—"
+        lines.append(
+            f"| {int(row.parallel_size)} | {int(row.M)} | {gate_up_display} | "
+            f"{down_display} | {combined_display} |"
         )
     lines += [
         "",
@@ -424,7 +460,7 @@ def aggregate_and_plot(
         if figure.stat().st_size == 0 or figure.read_bytes()[:4] != b"\x89PNG":
             issues.append(f"invalid PNG: {figure}")
 
-    _summary(summary_path, sources, paired, model_name, parameters)
+    _summary(summary_path, sources, paired, combined, model_name, parameters)
     report = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "valid": not issues,

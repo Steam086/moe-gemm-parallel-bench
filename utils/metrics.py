@@ -59,7 +59,12 @@ def moe_shapes(
         raise ValueError("ffn_size must be divisible by parallel_size")
     count = experts // parallel_size if parallel_type == "EP" else experts
     if projection == "W1":
-        shape = (m, hidden, ffn if parallel_type == "EP" else ffn // parallel_size)
+        # Gated MoE MLPs pack W1 (gate) and W3 (up) along the output
+        # dimension, matching the W13 layout used by vLLM.  A TP rank owns
+        # F/P columns from each projection, so the one-launch grouped GEMM
+        # writes [gate_local, up_local] with total width 2*F/P.
+        local_ffn = ffn if parallel_type == "EP" else ffn // parallel_size
+        shape = (m, hidden, 2 * local_ffn)
     elif projection == "W2":
         shape = (m, ffn if parallel_type == "EP" else ffn // parallel_size, hidden)
     else:
