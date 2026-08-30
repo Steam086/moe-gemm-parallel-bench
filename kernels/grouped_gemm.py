@@ -24,9 +24,28 @@ except ImportError:
 from .matmul import (
     _MATMUL_CONFIG_POOL,
     KernelConfig,
+    last_matmul_config,
+    launch_matmul,
     matmul_candidate_configs,
     select_config,
 )
+
+# Extra portable tiles for skinny-M MoE groups. They deliberately remain a
+# small curated extension of the standalone GEMM pool so Triton compilation
+# and autotuning stay bounded.
+_GROUPED_EXTRA_CONFIG_POOL: tuple[KernelConfig, ...] = (
+    KernelConfig(16, 64, 64, 4, 4, 3),
+    KernelConfig(16, 128, 128, 4, 4, 4),
+    KernelConfig(16, 256, 32, 4, 8, 3),
+    KernelConfig(16, 256, 64, 4, 8, 4),
+    KernelConfig(32, 64, 128, 4, 4, 4),
+    KernelConfig(32, 128, 128, 4, 8, 4),
+    KernelConfig(32, 256, 64, 4, 8, 4),
+    KernelConfig(64, 32, 64, 4, 4, 3),
+    KernelConfig(64, 256, 128, 4, 8, 4),
+    KernelConfig(128, 128, 128, 8, 8, 4),
+)
+_GROUPED_BASE_CONFIG_POOL = tuple(dict.fromkeys((*_MATMUL_CONFIG_POOL, *_GROUPED_EXTRA_CONFIG_POOL)))
 
 
 @dataclass
@@ -76,13 +95,125 @@ def grouped_candidate_configs(
     max_m: int,
     max_n: int,
     max_k: int,
-    base_limit: int = 6,
+    base_limit: int = 8,
+    *,
+    problem_count: int = 1,
+    sm_count: int = 0,
 ) -> tuple[KernelConfig, ...]:
-    """Shape-family grouped candidates including persistent CTA-count tuning."""
-    base = matmul_candidate_configs(max_m, max_n, max_k, limit=base_limit)
+    """Workload-aware tile and persistent-grid candidates.
+
+    The grouped MoE path needs a broader small-M search than a standalone
+    GEMM: a narrower N tile can expose enough independent expert tiles to fill
+    the device even when padding efficiency alone would rank it lower. The
+    final choice is measured by Triton's autotuner (hot mode) or by the
+    rotating-workspace tuner (cold mode); this function only keeps that search
+    bounded and avoids CTA-count variants that launch the same grid.
+    """
+    if min(max_m, max_n, max_k, problem_count) <= 0:
+        raise ValueError("grouped candidate dimensions and problem_count must be positive")
+    if sm_count < 0:
+        raise ValueError("sm_count must be non-negative")
+
+    # A one-problem group is dispatched to the standard matmul kernel, so CTA
+    # persistence is not a tuning dimension for that case.
+    if problem_count == 1:
+        return tuple(
+            KernelConfig(
+                cfg.block_m,
+                cfg.block_n,
+                cfg.block_k,
+                cfg.group_size_m,
+                cfg.num_warps,
+                cfg.num_stages,
+                1,
+            )
+            for cfg in matmul_candidate_configs(max_m, max_n, max_k, limit=base_limit)
+        )
+
+    # These additions target the skinny-M MoE shapes that the standalone GEMM
+    # family intentionally prunes more aggressively. In particular, N=64
+    # tiles can provide useful parallelism for TP shards and wide W2 outputs.
+    if max_m <= 32:
+        block_ms = {16, 32, 64}
+    elif max_m <= 64:
+        block_ms = {32, 64, 128}
+    elif max_m <= 128:
+        block_ms = {64, 128}
+    else:
+        block_ms = {64, 128, 256}
+    if max_n <= 32:
+        block_ns = {32, 64}
+    elif max_n <= 64:
+        block_ns = {32, 64, 128}
+    elif max_n <= 128:
+        block_ns = {64, 128, 256}
+    else:
+        # Keep N=64 for small-M grouped workloads: the extra output tiles can
+        # matter more than padding efficiency when expert count is modest.
+        block_ns = {64, 128, 256} if max_m <= 64 else {128, 256}
+
+    base = [
+        cfg
+        for cfg in _GROUPED_BASE_CONFIG_POOL
+        if cfg.block_m in block_ms
+        and cfg.block_n in block_ns
+        and (cfg.block_k <= max_k or cfg.block_k == 32)
+    ]
+    fallback = select_config(max_m, max_n, max_k)
+    if fallback not in base:
+        base.append(fallback)
+
+    def rank(cfg: KernelConfig) -> tuple[float, float, int, int, int]:
+        m_tiles = math.ceil(max_m / cfg.block_m)
+        n_tiles = math.ceil(max_n / cfg.block_n)
+        k_tiles = math.ceil(max_k / cfg.block_k)
+        padded = m_tiles * cfg.block_m * n_tiles * cfg.block_n * k_tiles * cfg.block_k
+        useful = max_m * max_n * max_k
+        compute_efficiency = useful / padded
+        total_tiles = problem_count * m_tiles * n_tiles
+        # Prefer enough independent work to cover the device, but let measured
+        # autotuning decide whether the extra/smaller tiles are actually faster.
+        parallelism = min(1.0, total_tiles / sm_count) if sm_count else 1.0
+        score = compute_efficiency * (0.85 + 0.15 * parallelism)
+        return (-score, -parallelism, cfg.block_m * cfg.block_n, cfg.block_k, cfg.num_warps)
+
+    ordered = sorted(dict.fromkeys(base), key=rank)
+
+    # Preserve diversity across the dimensions that materially change tensor
+    # core utilization and occupancy, then fill the remaining bounded budget by
+    # the analytical rank above. Actual hardware timing still chooses the
+    # winner.
+    selected_base: list[KernelConfig] = []
+
+    def add_first(predicate) -> None:
+        candidate = next((cfg for cfg in ordered if predicate(cfg)), None)
+        if candidate is not None and candidate not in selected_base:
+            selected_base.append(candidate)
+
+    for block_m in sorted(block_ms):
+        add_first(lambda cfg, value=block_m: cfg.block_m == value)
+    for block_n in sorted(block_ns):
+        add_first(lambda cfg, value=block_n: cfg.block_n == value)
+    for block_k in (32, 64, 128):
+        if block_k <= max_k:
+            add_first(lambda cfg, value=block_k: cfg.block_k == value)
+    for warps in (2, 4, 8):
+        add_first(lambda cfg, value=warps: cfg.num_warps == value)
+    for cfg in ordered:
+        if cfg not in selected_base:
+            selected_base.append(cfg)
+        if len(selected_base) >= max(1, base_limit):
+            break
+    selected_base = selected_base[: max(1, base_limit)]
+
     candidates: list[KernelConfig] = []
-    for cfg in base:
-        multipliers = (1, 2, 4) if cfg.block_m <= 32 else (1, 2)
+    for cfg in selected_base:
+        total_tiles = problem_count * math.ceil(max_m / cfg.block_m) * math.ceil(max_n / cfg.block_n)
+        multipliers = [1]
+        if not sm_count or total_tiles > sm_count:
+            multipliers.append(2)
+        if cfg.block_m <= 32 and (not sm_count or total_tiles > 2 * sm_count):
+            multipliers.append(4)
         candidates.extend(
             KernelConfig(
                 cfg.block_m,
@@ -147,7 +278,7 @@ if _runtime_ready():
             cfg.num_stages,
             multiplier,
         )
-        for cfg in _MATMUL_CONFIG_POOL
+        for cfg in _GROUPED_BASE_CONFIG_POOL
         for multiplier in ((1, 2, 4) if cfg.block_m <= 32 else (1, 2))
     )
     _grouped_triton_configs = [
@@ -170,7 +301,11 @@ if _runtime_ready():
         wanted = {
             _config_key(cfg)
             for cfg in grouped_candidate_configs(
-                int(arguments["MAX_M"]), int(arguments["MAX_N"]), int(arguments["MAX_K"])
+                int(arguments["MAX_M"]),
+                int(arguments["MAX_N"]),
+                int(arguments["MAX_K"]),
+                problem_count=int(arguments.get("PROBLEM_COUNT", arguments.get("problem_count", 1))),
+                sm_count=int(arguments["SM_COUNT"]),
             )
         }
         return [
@@ -205,6 +340,7 @@ if _runtime_ready():
         PROBLEM_COUNT: tl.constexpr,
         SHAPE_SIGNATURE: tl.constexpr,
         DEVICE_SIGNATURE: tl.constexpr,
+        SM_COUNT: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
@@ -213,7 +349,7 @@ if _runtime_ready():
         INPUT_PRECISION: tl.constexpr,
     ):
         tile_id = tl.program_id(0)
-        grid_size = tl.num_programs(0) + CTA_MULTIPLIER * 0
+        grid_size = tl.num_programs(0) + CTA_MULTIPLIER * 0 + SM_COUNT * 0
         num_m_tiles = tl.cdiv(M, BLOCK_M)
         num_n_tiles = tl.cdiv(N, BLOCK_N)
         tiles_per_problem = num_m_tiles * num_n_tiles
@@ -238,19 +374,31 @@ if _runtime_ready():
             offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
             offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
             offs_k = tl.arange(0, BLOCK_K)
+            # Map only out-of-bounds edge lanes to a valid row/column. This
+            # removes M/N masks from every K-loop load while the final store
+            # remains masked. The pattern also gives Triton useful contiguity
+            # information for this contiguous homogeneous fast path.
+            load_m = tl.where(offs_m < M, offs_m, 0)
+            load_n = tl.where(offs_n < N, offs_n, 0)
+            load_m = tl.max_contiguous(tl.multiple_of(load_m, BLOCK_M), BLOCK_M)
+            load_n = tl.max_contiguous(tl.multiple_of(load_n, BLOCK_N), BLOCK_N)
+            a_tile = a_ptr + load_m[:, None] * K + offs_k[None, :]
+            b_tile = b_ptr + offs_k[:, None] * N + load_n[None, :]
             accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
             for k_start in range(0, K, BLOCK_K):
                 a = tl.load(
-                    a_ptr + offs_m[:, None] * K + k_start + offs_k[None, :],
-                    mask=(offs_m[:, None] < M) & (k_start + offs_k[None, :] < K),
+                    a_tile,
+                    mask=k_start + offs_k[None, :] < K,
                     other=0.0,
                 )
                 b = tl.load(
-                    b_ptr + (k_start + offs_k[:, None]) * N + offs_n[None, :],
-                    mask=(k_start + offs_k[:, None] < K) & (offs_n[None, :] < N),
+                    b_tile,
+                    mask=k_start + offs_k[:, None] < K,
                     other=0.0,
                 )
                 accumulator += tl.dot(a, b, input_precision=INPUT_PRECISION)
+                a_tile += BLOCK_K
+                b_tile += BLOCK_K * N
             tl.store(
                 c_ptr + offs_m[:, None] * N + offs_n[None, :],
                 accumulator,
@@ -274,6 +422,7 @@ if _runtime_ready():
         MAX_K: tl.constexpr,
         SHAPE_SIGNATURE: tl.constexpr,
         DEVICE_SIGNATURE: tl.constexpr,
+        SM_COUNT: tl.constexpr,
         BLOCK_M: tl.constexpr,
         BLOCK_N: tl.constexpr,
         BLOCK_K: tl.constexpr,
@@ -282,7 +431,7 @@ if _runtime_ready():
         INPUT_PRECISION: tl.constexpr,
     ):
         tile_id = tl.program_id(0)
-        grid_size = tl.num_programs(0) + CTA_MULTIPLIER * 0
+        grid_size = tl.num_programs(0) + CTA_MULTIPLIER * 0 + SM_COUNT * 0
         last_problem_end = 0
         for problem in range(problem_count):
             m = tl.load(dims + problem * 3)
@@ -348,6 +497,7 @@ if _runtime_ready():
         "MAX_K",
         "SHAPE_SIGNATURE",
         "DEVICE_SIGNATURE",
+        "SM_COUNT",
         "INPUT_PRECISION",
     ]
     _homogeneous_grouped_kernel = triton.autotune(
@@ -462,12 +612,25 @@ def launch_grouped(
     if _homogeneous_grouped_kernel_impl is None or _generic_grouped_kernel_impl is None:
         raise RuntimeError("Triton with an active CUDA driver is required")
     cfg = config or workspace.config
+    if workspace.problem_count == 1:
+        launch_matmul(
+            workspace.a[0],
+            workspace.b[0],
+            workspace.c[0],
+            cfg,
+            input_precision,
+            autotune=autotune,
+        )
+        workspace.config = last_matmul_config(cfg) if autotune else cfg
+        workspace.scheduler = "single_problem_matmul"
+        return
     common = {
         "MAX_M": workspace.max_m,
         "MAX_N": workspace.max_n,
         "MAX_K": workspace.max_k,
         "SHAPE_SIGNATURE": workspace.shape_signature,
         "DEVICE_SIGNATURE": workspace.device_signature,
+        "SM_COUNT": workspace.sm_count,
         "INPUT_PRECISION": input_precision,
     }
     anchors = (workspace.a[0], workspace.b[0], workspace.c[0])
@@ -518,6 +681,7 @@ def launch_grouped(
             PROBLEM_COUNT=workspace.problem_count,
             SHAPE_SIGNATURE=workspace.shape_signature,
             DEVICE_SIGNATURE=workspace.device_signature,
+            SM_COUNT=workspace.sm_count,
             BLOCK_M=cfg.block_m,
             BLOCK_N=cfg.block_n,
             BLOCK_K=cfg.block_k,

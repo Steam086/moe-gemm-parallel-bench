@@ -8,6 +8,8 @@ from collections.abc import Iterable
 from datetime import datetime, timezone
 from pathlib import Path
 
+MOE_MODES = {"grouped", "torch"}
+
 CONSISTENT_EFFECTIVE_PARAMETERS = (
     "hidden_size",
     "ffn_size",
@@ -128,6 +130,10 @@ def _load_runs(run_dirs: dict[int, Path]):
             frame = pd.read_csv(csv_path)
             if run_id and "run_id" in frame:
                 frame = frame[frame.run_id.astype(str) == run_id].copy()
+            if "mode" in frame:
+                # Do not reintroduce the removed per-expert single mode when
+                # aggregating older result directories.
+                frame = frame[frame["mode"].isin(MOE_MODES)].copy()
             if frame.empty:
                 issues.append(f"P={parallel_size}: no {projection} rows for run_id={run_id}")
                 continue
@@ -283,7 +289,7 @@ def _ratio_plot(paired, output: Path, projection: str, model_name: str) -> Path 
     ms = _m_values(data)
     colors = _colors(ms)
     sizes = sorted({int(value) for value in data.parallel_size.unique()})
-    modes = [mode for mode in ("single", "grouped", "torch") if mode in set(data["mode"])]
+    modes = [mode for mode in ("grouped", "torch") if mode in set(data["mode"])]
     fig, axes = plt.subplots(1, len(modes), figsize=(5 * len(modes), 5), sharey=True)
     if len(modes) == 1:
         axes = [axes]

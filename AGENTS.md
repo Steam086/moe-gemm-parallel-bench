@@ -43,6 +43,7 @@ On a CUDA/Triton host also run:
 ```bash
 python -m pytest -q tests/test_gpu.py
 python benchmark.py --experiment shapes --shape-ms 16,32 --repeat 5 --warmup 2 --no-plots
+python benchmark.py --experiment moe --moe-ms 16,32 --repeat 5 --warmup 2 --no-plots
 ```
 
 A full default benchmark is expensive and is not required for documentation-only changes. If GPU validation is unavailable, report that explicitly; never imply it passed.

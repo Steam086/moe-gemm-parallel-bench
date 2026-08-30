@@ -118,11 +118,12 @@ External absolute paths are accepted, but persisted provenance stores only a saf
 
 ### Scheduling modes
 
-- `single`: launches one Triton kernel per local expert GEMM. This intentionally exposes sequential launch and small-GEMM costs.
-- `grouped`: launches a bounded persistent CTA grid. Equal contiguous shapes use a constexpr fast path; heterogeneous shapes use device-side dimensions and strides.
+- `grouped`: the MoE Triton provider launches one bounded persistent CTA grid for all local expert GEMMs. Equal contiguous shapes use an optimized constexpr fast path; heterogeneous shapes use device-side dimensions and strides. A one-problem group dispatches to the standard Triton matmul kernel instead of retaining grouped-scheduler overhead.
 - `torch`: sequential `torch.mm` baseline, enabled by default and removable with `--no-torch-baseline`.
 
-Triton autotuning uses a bounded shape-family candidate set. Compilation, autotuning, allocation, random initialization, reference calculation, and correctness checks occur before timing. Timed repetitions are enqueued back-to-back with CUDA events and synchronized once at the end, avoiding a host synchronization between every sample.
+The standalone shape and heatmap experiments still use the single-GEMM Triton kernel; it is not emitted as a MoE scheduling curve.
+
+Grouped Triton autotuning uses a bounded workload-aware candidate set. It searches `BLOCK_M`, `BLOCK_N`, `BLOCK_K`, warp/stage counts, and persistent CTA count while accounting for problem count, total output tiles, padding, and the active device's SM count. Hot-mode candidates are measured by Triton's autotuner; cold-mode candidates are measured while rotating across the complete resident workspace ring. Compilation, autotuning, allocation, random initialization, reference calculation, and correctness checks occur before timing. Timed repetitions are enqueued back-to-back with CUDA events and synchronized once at the end, avoiding a host synchronization between every sample.
 
 FP32 precision is explicit:
 
@@ -166,7 +167,7 @@ python plot_results.py --results-dir results --plots-dir plots
 python validate_results.py --results-dir results --plots-dir plots
 ```
 
-Validation recomputes derivable FLOPs and TFLOPS, checks correctness/status fields, verifies matched MoE FLOPs, and checks generated PNG signatures/counts.
+Validation recomputes derivable FLOPs and TFLOPS, checks correctness/status fields, verifies matched MoE FLOPs, requires every successful Triton MoE row to record a selected workload-aware grouped configuration and supported scheduler, rejects the removed MoE `single` mode, and checks generated PNG signatures/counts.
 
 ## Parallel-size sweeps
 
@@ -217,9 +218,10 @@ CUDA/Triton checks:
 
 ```bash
 python -m pytest -q tests/test_gpu.py
+python benchmark.py --experiment moe --moe-ms 16,32 --repeat 5 --warmup 2 --no-plots
 ```
 
-GPU tests are skipped when CUDA PyTorch is unavailable. See [`AGENTS.md`](AGENTS.md) for contributor and automated-agent guidance.
+The representative MoE run is also the minimum performance sanity check for grouped tile selection and autotuning; inspect the selected configuration, scheduler, latency, and the optional `torch` baseline in its CSV output. GPU tests are skipped when CUDA PyTorch is unavailable. See [`AGENTS.md`](AGENTS.md) for contributor and automated-agent guidance.
 
 ## Limitations
 

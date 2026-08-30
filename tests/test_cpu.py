@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import argparse
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from benchmark import main, parser
+from benchmark_moe import run_moe
 from kernels.grouped_gemm import grouped_candidate_configs
 from kernels.matmul import matmul_candidate_configs
 from plot_parallel_sweep import parse_run_spec
 from utils.config import load_model_defaults
 from utils.io import CSV_FIELDS
 from utils.metrics import arithmetic_intensity, gemm_flops, moe_shapes, tile_metrics, verify_ep_tp_flops
-from validate_results import _derivable_metrics_valid
+from validate_results import _derivable_metrics_valid, _moe_execution_contract_valid
 
 
 class CpuMathTests(unittest.TestCase):
@@ -50,6 +54,12 @@ class CpuMathTests(unittest.TestCase):
             self.assertEqual(total, ep)
             self.assertEqual(ep, tp)
 
+    def test_ep_tp_shapes_split_the_intended_dimension(self) -> None:
+        self.assertEqual(moe_shapes("W1", "EP", 17, 7168, 2048, 256, 8), [(17, 7168, 2048)] * 32)
+        self.assertEqual(moe_shapes("W1", "TP", 17, 7168, 2048, 256, 8), [(17, 7168, 256)] * 256)
+        self.assertEqual(moe_shapes("W2", "EP", 17, 7168, 2048, 256, 8), [(17, 2048, 7168)] * 32)
+        self.assertEqual(moe_shapes("W2", "TP", 17, 7168, 2048, 256, 8), [(17, 256, 7168)] * 256)
+
     def test_shape_and_tile_metrics(self) -> None:
         self.assertEqual(gemm_flops(2, 3, 4), 48)
         self.assertGreater(arithmetic_intensity(16, 32, 64, 2), 0)
@@ -71,8 +81,38 @@ class CpuMathTests(unittest.TestCase):
         self.assertTrue(any(cfg.block_n == 256 for cfg in wide))
         self.assertTrue(any(cfg.block_k == 128 for cfg in wide))
         self.assertTrue(any(cfg.block_m == 256 for cfg in skinny_n))
-        grouped = grouped_candidate_configs(16, 256, 7168)
+        grouped = grouped_candidate_configs(16, 256, 7168, problem_count=256, sm_count=120)
+        self.assertLessEqual(len(grouped), 24)
+        self.assertEqual({cfg.block_m for cfg in grouped}, {16, 32, 64})
+        self.assertEqual({cfg.block_n for cfg in grouped}, {64, 128, 256})
+        self.assertEqual({cfg.block_k for cfg in grouped}, {32, 64, 128})
+        self.assertEqual({cfg.num_warps for cfg in grouped}, {2, 4, 8})
         self.assertEqual({cfg.cta_multiplier for cfg in grouped}, {1, 2, 4})
+        one_problem = grouped_candidate_configs(16, 256, 7168, problem_count=1, sm_count=120)
+        self.assertEqual({cfg.cta_multiplier for cfg in one_problem}, {1})
+
+    def test_moe_experiment_has_no_single_mode(self) -> None:
+        args = SimpleNamespace(
+            num_experts=8,
+            parallel_size=4,
+            ffn_size=16,
+            hidden_size=32,
+            topk=1,
+            moe_ms=[1],
+            tokens=None,
+            torch_baseline=True,
+            results_dir=Path("unused"),
+        )
+        calls: list[str] = []
+
+        def fake_run_case(_args, _env, _projection, _parallel_type, mode, _m):
+            calls.append(mode)
+            return {"status": "skipped"}
+
+        with patch("benchmark_moe._run_case", side_effect=fake_run_case), patch("benchmark_moe.write_rows"):
+            run_moe(args, {})
+        self.assertEqual(set(calls), {"grouped", "torch"})
+        self.assertNotIn("single", calls)
 
     def test_baseline_and_provenance_defaults(self) -> None:
         self.assertTrue(parser().parse_args([]).torch_baseline)
@@ -106,6 +146,25 @@ class CpuMathTests(unittest.TestCase):
         self.assertTrue(_derivable_metrics_valid(row))
         self.assertFalse(_derivable_metrics_valid({**row, "total_flops": "241"}))
         self.assertFalse(_derivable_metrics_valid({**row, "tflops": "1"}))
+
+    def test_moe_execution_contract_requires_tuned_grouped_mode(self) -> None:
+        grouped = {
+            "mode": "grouped",
+            "autotune_enabled": "True",
+            "autotune_status": "selected",
+            "config_source": "workload_autotune",
+            "scheduler": "homogeneous_persistent",
+            "launches_per_iteration": "1",
+            "block_m": "16",
+            "block_n": "128",
+            "block_k": "64",
+            "num_warps": "4",
+            "num_stages": "3",
+            "cta_multiplier": "2",
+        }
+        self.assertTrue(_moe_execution_contract_valid(grouped))
+        self.assertFalse(_moe_execution_contract_valid({**grouped, "mode": "single"}))
+        self.assertFalse(_moe_execution_contract_valid({**grouped, "autotune_status": "not_run"}))
 
     def test_parallel_sweep_run_spec(self) -> None:
         size, path = parse_run_spec("16=results/custom-p16")

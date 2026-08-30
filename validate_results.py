@@ -27,8 +27,37 @@ def _finite_positive(value: str) -> bool:
     try:
         number = float(value)
         return math.isfinite(number) and number > 0.0
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         return False
+
+
+def _positive_integer(value: str) -> bool:
+    try:
+        number = int(float(value))
+        return number > 0 and float(value) == number
+    except (OverflowError, TypeError, ValueError):
+        return False
+
+
+def _moe_execution_contract_valid(row: dict[str, str]) -> bool:
+    """Require measured MoE rows to use an explicit supported execution path."""
+    mode = row.get("mode")
+    if mode == "torch":
+        return row.get("scheduler") == "sequential_torch_mm"
+    if mode != "grouped":
+        return False
+    return (
+        _truthy(row.get("autotune_enabled", ""))
+        and row.get("autotune_status") == "selected"
+        and row.get("config_source") in {"workload_autotune", "cold_ring_autotune"}
+        and row.get("scheduler")
+        in {"homogeneous_persistent", "generic_persistent", "single_problem_matmul"}
+        and row.get("launches_per_iteration") == "1"
+        and all(
+            _positive_integer(row.get(field, ""))
+            for field in ("block_m", "block_n", "block_k", "num_warps", "num_stages", "cta_multiplier")
+        )
+    )
 
 
 def _derivable_metrics_valid(row: dict[str, str]) -> bool:
@@ -121,6 +150,9 @@ def validate_results(results_dir: str | Path = "results", plots_dir: str | Path 
             flops_ok = all(
                 filename not in {"moe_w1.csv", "moe_w2.csv"} or _truthy(row.get("flops_equal", "")) for row in ok_rows
             ) and (filename not in {"moe_w1.csv", "moe_w2.csv"} or _matched_moe_flops_equal(ok_rows))
+            execution_ok = filename not in {"moe_w1.csv", "moe_w2.csv"} or all(
+                _moe_execution_contract_valid(row) for row in ok_rows
+            )
             entry = {
                 "rows_for_current_run": len(rows),
                 "ok": len(ok_rows),
@@ -130,6 +162,7 @@ def validate_results(results_dir: str | Path = "results", plots_dir: str | Path 
                 "positive_finite_metrics": numeric_ok,
                 "derivable_metrics_recomputed": metrics_ok,
                 "flops_equal": flops_ok,
+                "execution_contract": execution_ok,
             }
             report["files"][filename] = entry
             any_ok = any_ok or bool(ok_rows)
@@ -137,8 +170,8 @@ def validate_results(results_dir: str | Path = "results", plots_dir: str | Path 
                 report["issues"].append(f"{filename}: no rows for run_id={run_id}")
             if bad:
                 report["issues"].append(f"{filename}: {len(bad)} invalid/error rows")
-            if not numeric_ok or not metrics_ok or not correctness_ok or not flops_ok:
-                report["issues"].append(f"{filename}: failed numeric/correctness/FLOP checks")
+            if not numeric_ok or not metrics_ok or not correctness_ok or not flops_ok or not execution_ok:
+                report["issues"].append(f"{filename}: failed numeric/correctness/FLOP/execution checks")
 
     plot_files = sorted(plots.glob("figure_*.png"))
     unexpected_pdfs = sorted(plots.glob("figure_*.pdf"))

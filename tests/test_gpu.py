@@ -75,6 +75,13 @@ class TritonCorrectnessTests(unittest.TestCase):
         for a, b, c in zip(workspace.a, workspace.b, workspace.c):
             assert_close(c, a @ b, "fp16")
 
+    def test_one_problem_group_dispatches_standard_matmul(self) -> None:
+        workspace = build_grouped_workspace([(17, 70, 65)], torch.float16, seed=103)
+        launch_grouped(workspace)
+        torch.cuda.synchronize()
+        self.assertEqual(workspace.scheduler, "single_problem_matmul")
+        assert_close(workspace.c[0], workspace.a[0] @ workspace.b[0], "fp16")
+
 
 if __name__ == "__main__":
     unittest.main()

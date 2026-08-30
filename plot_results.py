@@ -6,6 +6,16 @@ import argparse
 import json
 from pathlib import Path
 
+MOE_MODES = {"grouped", "torch"}
+
+
+def _supported_moe_modes(frame):
+    if frame.empty or "mode" not in frame:
+        return frame
+    # Old result directories can contain the removed per-expert `single` mode.
+    # Replotting them must not resurrect that deprecated MoE curve.
+    return frame[frame["mode"].isin(MOE_MODES)].copy()
+
 
 def _load(path: Path, run_id: str | None = None):
     import pandas as pd
@@ -66,6 +76,7 @@ def _line_shape(frame, plots: Path, y: str, ylabel: str, stem: str, title: str) 
 def _moe_curves(frame, plots: Path, projection: str, model_name: str) -> None:
     import matplotlib.pyplot as plt
 
+    frame = _supported_moe_modes(frame)
     if frame.empty:
         return
     fig, ax = plt.subplots(figsize=(8, 5))
@@ -107,6 +118,7 @@ def _ratio(frame, value: str):
 def _ratio_plot(frame, plots: Path, projection: str, model_name: str, latency: bool = False) -> None:
     import matplotlib.pyplot as plt
 
+    frame = _supported_moe_modes(frame)
     value = "latency_ms" if latency else "tflops"
     data = _ratio(frame, value)
     if data.empty:
@@ -155,8 +167,8 @@ def generate_summary(results: Path, run_id: str | None = None, model_name: str =
     import pandas as pd
 
     shapes = _load(results / "gemm_shape_sweep.csv", run_id)
-    w1 = _load(results / "moe_w1.csv", run_id)
-    w2 = _load(results / "moe_w2.csv", run_id)
+    w1 = _supported_moe_modes(_load(results / "moe_w1.csv", run_id))
+    w2 = _supported_moe_modes(_load(results / "moe_w2.csv", run_id))
     lines = [
         f"# {model_name} benchmark summary",
         "",
@@ -194,7 +206,7 @@ def generate_summary(results: Path, run_id: str | None = None, model_name: str =
             continue
         ratio = _ratio(frame, "tflops")
         lines += [f"### {projection}", ""]
-        for mode in ("single", "grouped", "torch"):
+        for mode in ("grouped", "torch"):
             part = ratio[ratio["mode"] == mode]
             if part.empty:
                 lines.append(f"- {mode}: no matched EP/TP rows.")
@@ -203,7 +215,6 @@ def generate_summary(results: Path, run_id: str | None = None, model_name: str =
                     f"- {mode}: TP/EP throughput ratio {part.ratio.min():.3f}–{part.ratio.max():.3f} (median {part.ratio.median():.3f})."
                 )
         grouped = ratio[ratio["mode"] == "grouped"].sort_values("M")
-        single = ratio[ratio["mode"] == "single"]
         if not grouped.empty:
             near = [str(int(x)) for x in grouped.loc[grouped.ratio.between(0.9, 1.1), "M"]]
             slow = [str(int(x)) for x in grouped.loc[grouped.ratio < 0.9, "M"]]
@@ -219,40 +230,14 @@ def generate_summary(results: Path, run_id: str | None = None, model_name: str =
                 lines.append(
                     f"| {int(item.M)} | {item.tflops_ep:.3f} | {item.tflops_tp:.3f} | {item.ratio:.3f} | {item.latency_ms_ep:.4f} | {item.latency_ms_tp:.4f} |"
                 )
-        if not grouped.empty and not single.empty:
-            joined = grouped[["M", "ratio"]].merge(single[["M", "ratio"]], on="M", suffixes=("_grouped", "_single"))
-            improved = int((joined.ratio_grouped > joined.ratio_single).sum())
-            verdict = "supports" if improved > len(joined) / 2 else "does not support"
-            lines.append(
-                f"- Grouping improves the TP/EP ratio at {improved}/{len(joined)} matched M values; this **{verdict}** cross-expert scheduling recovery on this run."
-            )
-        raw_single = frame[frame["mode"] == "single"][["M", "parallel_type", "tflops"]]
-        raw_grouped = frame[frame["mode"] == "grouped"][["M", "parallel_type", "tflops"]]
-        absolute = raw_grouped.merge(
-            raw_single, on=["M", "parallel_type"], suffixes=("_grouped", "_single"), validate="one_to_one"
-        )
-        if not absolute.empty:
-            absolute["grouped_over_single"] = absolute.tflops_grouped / absolute.tflops_single
-            descriptions = []
-            for parallel_type in ("EP", "TP"):
-                part = absolute[absolute.parallel_type == parallel_type]
-                if not part.empty:
-                    descriptions.append(
-                        f"{parallel_type} {part.grouped_over_single.min():.3f}–{part.grouped_over_single.max():.3f}"
-                    )
-            lines.append(
-                "- Absolute grouped/single throughput ratio: "
-                + ", ".join(descriptions)
-                + ". Relative TP/EP recovery does not imply this grouped kernel is faster in absolute terms."
-            )
         lines.append("")
     ratio_frames = [
-        part
+        part[part["mode"] == "grouped"]
         for part in (
             _ratio(w1, "tflops") if not w1.empty else pd.DataFrame(),
             _ratio(w2, "tflops") if not w2.empty else pd.DataFrame(),
         )
-        if not part.empty
+        if not part.empty and not part[part["mode"] == "grouped"].empty
     ]
     all_ratios = pd.concat(ratio_frames, ignore_index=True) if ratio_frames else pd.DataFrame()
     material_count = int(((all_ratios.ratio < 0.9) | (all_ratios.ratio > 1.1)).sum()) if not all_ratios.empty else 0
@@ -266,25 +251,25 @@ def generate_summary(results: Path, run_id: str | None = None, model_name: str =
                 "require a slowdown when aggregate scheduling compensates."
             )
     conclusion = (
-        f"Yes. {material_count}/{len(all_ratios)} matched mode/M/projection comparisons differ from parity by more than 10%; equal FLOPs coexist with materially different throughput.{near_parity_note}"
+        f"Yes. {material_count}/{len(all_ratios)} matched grouped M/projection comparisons differ from parity by more than 10%; equal FLOPs coexist with materially different throughput.{near_parity_note}"
         if material_count
         else "No material >10% matched throughput difference was observed in this run."
     )
     correlations = []
     for projection, frame in (("W1", w1), ("W2", w2)):
-        if len(frame) >= 3:
+        grouped_frame = frame[frame["mode"] == "grouped"]
+        if len(grouped_frame) >= 3:
             correlations.append(
-                f"{projection}: corr(TFLOPS, AI)={frame.tflops.corr(frame.arithmetic_intensity):.3f}, corr(TFLOPS, output tiles)={frame.tflops.corr(frame.total_output_tiles_per_rank):.3f}, corr(TFLOPS, waves)={frame.tflops.corr(frame.estimated_waves):.3f}"
+                f"{projection}: corr(TFLOPS, AI)={grouped_frame.tflops.corr(grouped_frame.arithmetic_intensity):.3f}, corr(TFLOPS, output tiles)={grouped_frame.tflops.corr(grouped_frame.total_output_tiles_per_rank):.3f}, corr(TFLOPS, waves)={grouped_frame.tflops.corr(grouped_frame.estimated_waves):.3f}"
             )
     lines += [
         "## Interpretation",
         "",
-        "4–7. Exact per-M EP/TP TFLOPS and latency are in the CSVs and Figures 4–8; ranges above summarize single and grouped comparisons.",
-        "8. Grouped recovery is quantified by how often the grouped TP/EP ratio exceeds the single ratio, not presumed.",
-        "9. Treat ratios near 1 (roughly 0.9–1.1) as similar; inspect Figures 5/7 for the measured M ranges.",
-        "10. Simple Pearson relationships (descriptive, not causal): "
+        "4–7. Exact per-M EP/TP TFLOPS and latency are in the CSVs and Figures 4–8; grouped is the MoE kernel under study and torch is an optional sequential library baseline.",
+        "8. Treat ratios near 1 (roughly 0.9–1.1) as similar; inspect Figures 5/7 for the measured M ranges.",
+        "9. Simple Pearson relationships (descriptive, not causal): "
         + ("; ".join(correlations) if correlations else "insufficient valid rows."),
-        "11. Does this run support ‘equal theoretical FLOPs do not guarantee equal throughput’? **" + conclusion + "**",
+        "10. Does this run support ‘equal theoretical FLOPs do not guarantee equal throughput’? **" + conclusion + "**",
         "",
         "## Scope and caveats",
         "",

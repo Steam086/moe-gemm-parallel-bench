@@ -10,12 +10,7 @@ from kernels.grouped_gemm import (
     grouped_candidate_configs,
     launch_grouped,
 )
-from kernels.matmul import (
-    last_matmul_config,
-    launch_matmul,
-    matmul_candidate_configs,
-    select_config,
-)
+from kernels.matmul import select_config
 from utils.benchmark import (
     assert_close,
     available_budget,
@@ -169,47 +164,25 @@ def _run_case(args, env: dict[str, Any], projection: str, parallel_type: str, mo
 
             def tune_call(candidate, index: int) -> None:
                 current = workspaces[index % ring]
-                if mode == "single":
-                    for aa, bb, cc in zip(current.a, current.b, current.c):
-                        launch_matmul(
-                            aa,
-                            bb,
-                            cc,
-                            candidate,
-                            args.input_precision,
-                            autotune=False,
-                        )
-                else:
-                    launch_grouped(
-                        current,
-                        args.input_precision,
-                        candidate,
-                        autotune=False,
-                    )
-
-            if mode == "single":
-                candidates = matmul_candidate_configs(m, shapes[0][2], shapes[0][1])
-            else:
-                candidates = grouped_candidate_configs(
-                    max(mm for mm, _, _ in shapes),
-                    max(nn for _, _, nn in shapes),
-                    max(kk for _, kk, _ in shapes),
+                launch_grouped(
+                    current,
+                    args.input_precision,
+                    candidate,
+                    autotune=False,
                 )
+
+            candidates = grouped_candidate_configs(
+                max(mm for mm, _, _ in shapes),
+                max(nn for _, _, nn in shapes),
+                max(kk for _, kk, _ in shapes),
+                problem_count=len(shapes),
+                sm_count=workspaces[0].sm_count,
+            )
             rotating_tuning = tune_rotating_configs(candidates, tune_call, ring)
             cfg = rotating_tuning.config
         # Correctness-gate every workspace that the timed rotating ring can select.
         for workspace in workspaces:
-            if mode == "single":
-                for a, b, c in zip(workspace.a, workspace.b, workspace.c):
-                    launch_matmul(
-                        a,
-                        b,
-                        c,
-                        cfg,
-                        args.input_precision,
-                        autotune=args.cache_mode == "hot",
-                    )
-            elif mode == "grouped":
+            if mode == "grouped":
                 launch_grouped(
                     workspace,
                     args.input_precision,
@@ -230,10 +203,7 @@ def _run_case(args, env: dict[str, Any], projection: str, parallel_type: str, mo
                 max_rel = max(max_rel, rel_error)
                 del reference
         if mode != "torch":
-            if mode == "single" and args.cache_mode == "hot":
-                cfg = last_matmul_config(cfg)
-            elif mode == "grouped":
-                cfg = workspaces[0].config
+            cfg = workspaces[0].config
             row.update(
                 block_m=cfg.block_m,
                 block_n=cfg.block_n,
@@ -243,8 +213,8 @@ def _run_case(args, env: dict[str, Any], projection: str, parallel_type: str, mo
                 num_stages=cfg.num_stages,
                 cta_multiplier=cfg.cta_multiplier,
                 autotune_status="selected",
-                config_source=("cold_ring_autotune" if args.cache_mode == "cold" else "shape_family_autotune"),
-                scheduler=(workspaces[0].scheduler if mode == "grouped" else "one_program_per_output_tile"),
+                config_source=("cold_ring_autotune" if args.cache_mode == "cold" else "workload_autotune"),
+                scheduler=workspaces[0].scheduler,
                 **tile_metrics(
                     shapes,
                     cfg.block_m,
@@ -264,17 +234,7 @@ def _run_case(args, env: dict[str, Any], projection: str, parallel_type: str, mo
 
         def invoke(index: int) -> None:
             current = workspaces[index % ring]
-            if mode == "single":
-                for aa, bb, cc in zip(current.a, current.b, current.c):
-                    launch_matmul(
-                        aa,
-                        bb,
-                        cc,
-                        cfg,
-                        args.input_precision,
-                        autotune=args.cache_mode == "hot",
-                    )
-            elif mode == "grouped":
+            if mode == "grouped":
                 launch_grouped(
                     current,
                     args.input_precision,
@@ -343,7 +303,7 @@ def run_moe(args, env: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     outputs: dict[str, list[dict[str, Any]]] = {"W1": [], "W2": []}
     for projection in ("W1", "W2"):
         for m in ms:
-            modes = ["single", "grouped"]
+            modes = ["grouped"]
             if args.torch_baseline:
                 modes.append("torch")
             for mode in modes:
