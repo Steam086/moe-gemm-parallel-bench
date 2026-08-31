@@ -7,7 +7,7 @@ The project provides:
 - a masked Triton single-GEMM kernel;
 - a one-launch persistent grouped-GEMM kernel over distinct expert pointers;
 - equal-FLOP EP/TP workload construction for packed W1/W3 Gate+Up and W2 Down projections;
-- PyTorch `torch.mm` baselines under the same FP32/TF32 policy;
+- PyTorch `torch.mm` single-GEMM baselines and a native `torch.nn.functional.grouped_mm` MoE baseline;
 - hot and rotating-cold workspace regimes;
 - CSV provenance, plots, summaries, and offline result validation.
 
@@ -64,25 +64,22 @@ memory. W1/W3 therefore records twice the useful GEMM FLOPs of W2 for matching
 - Linux
 - Python 3.10–3.12
 - an NVIDIA GPU and driver supported by the selected PyTorch build
-- PyTorch 2.6–2.7 and Triton 3.2–3.3
+- PyTorch 2.13.x and Triton 3.7.1+
 
-Install a CUDA-compatible PyTorch wheel first. For example:
+Create and populate an environment with `uv`:
 
 ```bash
-python3.12 -m venv .venv
-. .venv/bin/activate
-python -m pip install --upgrade pip
-pip install --index-url https://download.pytorch.org/whl/cu124 torch==2.6.0
-pip install -r requirements.txt
+uv venv --python 3.12 .venv
+uv pip install --python .venv/bin/python -r requirements.txt
 ```
 
 For tests and linting:
 
 ```bash
-pip install -r requirements-dev.txt
+uv pip install --python .venv/bin/python -r requirements-dev.txt
 ```
 
-The CUDA wheel/index above is only an example. Choose versions compatible with your driver and GPU. Do not copy a wheel selection from another machine without checking compatibility.
+The default PyTorch 2.13 Linux wheel uses CUDA 13.0. Choose a different official wheel only when required by the installed driver and GPU; do not copy a wheel selection from another machine without checking compatibility.
 
 ## Quick start
 
@@ -141,11 +138,13 @@ External absolute paths are accepted, but persisted provenance stores only a saf
 ### Scheduling modes
 
 - `grouped`: the MoE Triton provider launches one bounded persistent CTA grid for all local expert GEMMs. W1/W3 packs Gate and Up into a single `2F_local` output and therefore remains one Triton launch, matching vLLM's W13 layout. Equal contiguous shapes use an optimized constexpr fast path; heterogeneous shapes use device-side dimensions and strides. A one-problem group dispatches to the standard Triton matmul kernel instead of retaining grouped-scheduler overhead.
-- `torch`: sequential `torch.mm` baseline, enabled by default and removable with `--no-torch-baseline`.
+- `torch`: one native `torch.nn.functional.grouped_mm` call over a 2D expert-sorted activation matrix, 3D expert weights, and cumulative `int32` offsets. It is enabled by default and removable with `--no-torch-baseline`; there is no sequential per-expert fallback. The public API requires PyTorch 2.10+ and CUDA SM80+. Backing storage is row-padded when necessary to satisfy the operator's 16-byte stride alignment without changing logical GEMM dimensions or useful FLOPs.
 
 The standalone shape and heatmap experiments still use the single-GEMM Triton kernel; it is not emitted as a MoE scheduling curve.
 
 Grouped Triton autotuning uses a bounded workload-aware candidate set. It searches `BLOCK_M`, `BLOCK_N`, `BLOCK_K`, warp/stage counts, and persistent CTA count while accounting for problem count, total output tiles, padding, and the active device's SM count. Hot-mode candidates are measured by Triton's autotuner; cold-mode candidates are measured while rotating across the complete resident workspace ring. Compilation, autotuning, allocation, random initialization, reference calculation, and correctness checks occur before timing. Timed repetitions are enqueued back-to-back with CUDA events and synchronized once at the end, avoiding a host synchronization between every sample.
+
+The PyTorch public grouped API returns a library-managed output and has no `out=` parameter. Before each repeated call the prior result is released, so after the untimed warmup PyTorch's caching allocator reuses the same output storage. CUDA events measure stream execution and exclude Python/host allocator bookkeeping. CSV rows record `output_preallocated=false` for this provider and `true` for the Triton provider.
 
 FP32 precision is explicit:
 
@@ -157,7 +156,7 @@ Every resident rotating-cold workspace is correctness-checked before timing.
 ### Cache regimes
 
 - `hot`: repeatedly uses one resident A/B/C workspace.
-- `cold`: rotates complete preallocated workspaces and pointer tables without allocation or copies in the timed region.
+- `cold`: rotates complete resident workspaces and metadata. Triton outputs are preallocated; the PyTorch provider reuses warmed caching-allocator output storage because its public API has no `out=` parameter.
 
 Rotating buffers reduce cache reuse but do not prove L2 misses; hardware counters are required for that claim.
 
@@ -192,8 +191,9 @@ python validate_results.py --results-dir results --plots-dir plots
 Validation recomputes derivable FLOPs and TFLOPS, checks the packed Gate+Up and
 Down projection contracts, verifies correctness/status fields and matched MoE
 FLOPs, requires every successful Triton MoE row to record a selected
-workload-aware grouped configuration and supported scheduler, rejects the
-removed MoE `single` mode, and checks generated PNG signatures/counts.
+workload-aware grouped configuration, requires the PyTorch MoE row to record
+one `torch_grouped_mm` launch, rejects the removed MoE `single` and sequential
+torch modes, and checks generated PNG signatures/counts.
 
 ## Parallel-size sweeps
 
@@ -252,7 +252,7 @@ python -m pytest -q tests/test_gpu.py
 python benchmark.py --experiment moe --moe-ms 16,32 --repeat 5 --warmup 2 --no-plots
 ```
 
-The representative MoE run is also the minimum performance sanity check for grouped tile selection and autotuning; inspect the selected configuration, scheduler, latency, and the optional `torch` baseline in its CSV output. GPU tests are skipped when CUDA PyTorch is unavailable. See [`AGENTS.md`](AGENTS.md) for contributor and automated-agent guidance.
+The representative MoE run is also the minimum performance sanity check for grouped tile selection and autotuning; inspect the selected configuration, scheduler, latency, and the optional native PyTorch grouped baseline in its CSV output. GPU tests are skipped when CUDA PyTorch is unavailable. See [`AGENTS.md`](AGENTS.md) for contributor and automated-agent guidance.
 
 ## Limitations
 

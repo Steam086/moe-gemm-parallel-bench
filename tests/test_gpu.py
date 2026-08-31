@@ -9,6 +9,7 @@ except ImportError:
 
 from kernels.grouped_gemm import build_fused_gate_up_workspace, build_grouped_workspace, launch_grouped
 from kernels.matmul import last_matmul_config, launch_matmul, select_config
+from kernels.torch_grouped_gemm import build_torch_grouped_workspace, launch_torch_grouped
 from utils.benchmark import assert_close
 
 
@@ -95,6 +96,22 @@ class TritonCorrectnessTests(unittest.TestCase):
         torch.cuda.synchronize()
         self.assertEqual(workspace.scheduler, "single_problem_matmul")
         assert_close(workspace.c[0], workspace.a[0] @ workspace.b[0], "fp16")
+
+    @unittest.skipUnless(
+        torch is not None and hasattr(torch.nn.functional, "grouped_mm"),
+        "public torch grouped_mm unavailable",
+    )
+    def test_torch_native_grouped_mm_workspace(self) -> None:
+        if torch.cuda.get_device_capability() < (8, 0) or not torch.cuda.is_bf16_supported():
+            self.skipTest("torch grouped_mm BF16 requires SM80+")
+        shapes = [(17, 13, 31)] * 3
+        workspace = build_torch_grouped_workspace(shapes, torch.bfloat16, seed=104)
+        self.assertEqual(workspace.offs.tolist(), [17, 34, 51])
+        launch_torch_grouped(workspace)
+        torch.cuda.synchronize()
+        self.assertEqual(workspace.scheduler, "torch_grouped_mm")
+        for a, b, c in workspace.problem_tensors():
+            assert_close(c, a @ b, "bf16")
 
 
 if __name__ == "__main__":

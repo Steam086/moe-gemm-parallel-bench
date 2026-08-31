@@ -93,6 +93,9 @@ class GroupedWorkspace:
     def tile_count(self) -> int:
         return self.tile_count_for(self.config)
 
+    def problem_tensors(self):
+        return zip(self.a, self.b, self.c)
+
 
 def grouped_candidate_configs(
     max_m: int,

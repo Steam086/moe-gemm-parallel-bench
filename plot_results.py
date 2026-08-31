@@ -13,9 +13,14 @@ PROJECTION_LABELS = {"W1": "W1/W3 Gate+Up", "W2": "W2 Down"}
 def _supported_moe_modes(frame):
     if frame.empty or "mode" not in frame:
         return frame
-    # Old result directories can contain the removed per-expert `single` mode.
-    # Replotting them must not resurrect that deprecated MoE curve.
-    return frame[frame["mode"].isin(MOE_MODES)].copy()
+    # Old result directories can contain the removed per-expert `single` mode
+    # and sequential torch baseline. Replotting must not resurrect either.
+    supported = frame[frame["mode"].isin(MOE_MODES)].copy()
+    if "scheduler" not in supported:
+        return supported[supported["mode"] != "torch"].copy()
+    return supported[
+        (supported["mode"] != "torch") | (supported["scheduler"] == "torch_grouped_mm")
+    ].copy()
 
 
 def _load(path: Path, run_id: str | None = None):
@@ -274,7 +279,7 @@ def generate_summary(results: Path, run_id: str | None = None, model_name: str =
     lines += [
         "## Interpretation",
         "",
-        "4–7. Exact per-M EP/TP TFLOPS and latency are in the CSVs and Figures 4–8; grouped is the MoE kernel under study and torch is an optional sequential library baseline.",
+        "4–7. Exact per-M EP/TP TFLOPS and latency are in the CSVs and Figures 4–8; grouped is the Triton MoE kernel under study and torch is the optional native grouped_mm library baseline.",
         "8. Treat ratios near 1 (roughly 0.9–1.1) as similar; inspect Figures 5/7 for the measured M ranges.",
         "9. Simple Pearson relationships (descriptive, not causal): "
         + ("; ".join(correlations) if correlations else "insufficient valid rows."),

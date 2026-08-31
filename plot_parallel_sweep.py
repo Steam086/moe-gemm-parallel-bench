@@ -132,9 +132,13 @@ def _load_runs(run_dirs: dict[int, Path]):
             if run_id and "run_id" in frame:
                 frame = frame[frame.run_id.astype(str) == run_id].copy()
             if "mode" in frame:
-                # Do not reintroduce the removed per-expert single mode when
-                # aggregating older result directories.
+                # Do not reintroduce removed single or sequential-torch modes
+                # when aggregating older result directories.
                 frame = frame[frame["mode"].isin(MOE_MODES)].copy()
+                if "scheduler" not in frame:
+                    frame = frame[frame["mode"] != "torch"].copy()
+                else:
+                    frame = frame[(frame["mode"] != "torch") | (frame["scheduler"] == "torch_grouped_mm")]
             if frame.empty:
                 issues.append(f"P={parallel_size}: no {projection} rows for run_id={run_id}")
                 continue

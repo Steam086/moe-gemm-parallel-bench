@@ -117,11 +117,13 @@ def percentile(values: Sequence[float], q: float) -> float:
 def time_cuda(
     function: Callable[[int], None], requested_warmup: int, requested_repeat: int, target_ms: float = 2000.0
 ) -> TimingResult:
-    """Measure back-to-back, preallocated launches with CUDA events.
+    """Measure back-to-back CUDA stream execution with CUDA events.
 
-    Indexing permits allocation-free rotating workspaces. All measured work is
-    enqueued before one final synchronization so each repetition is not forced
-    into an artificial empty-stream request/response cycle.
+    Indexing permits rotating resident workspaces. Callers compile, autotune,
+    and warm any library-managed caching-allocator storage before measured
+    samples. All measured work is enqueued before one final synchronization so
+    each repetition is not forced into an artificial empty-stream
+    request/response cycle.
     """
     import torch
 

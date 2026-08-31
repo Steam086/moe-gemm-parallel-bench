@@ -47,7 +47,11 @@ def _moe_execution_contract_valid(row: dict[str, str]) -> bool:
     """Require measured MoE rows to use an explicit supported execution path."""
     mode = row.get("mode")
     if mode == "torch":
-        return row.get("scheduler") == "sequential_torch_mm"
+        return (
+            row.get("scheduler") == "torch_grouped_mm"
+            and row.get("launches_per_iteration") == "1"
+            and _falsey(row.get("output_preallocated", ""))
+        )
     if mode != "grouped":
         return False
     return (
@@ -57,6 +61,7 @@ def _moe_execution_contract_valid(row: dict[str, str]) -> bool:
         and row.get("scheduler")
         in {"homogeneous_persistent", "generic_persistent", "single_problem_matmul"}
         and row.get("launches_per_iteration") == "1"
+        and _truthy(row.get("output_preallocated", ""))
         and all(
             _positive_integer(row.get(field, ""))
             for field in ("block_m", "block_n", "block_k", "num_warps", "num_stages", "cta_multiplier")

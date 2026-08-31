@@ -77,6 +77,7 @@ CSV_FIELDS = [
     "tile_efficiency",
     "output_tile_efficiency",
     "launches_per_iteration",
+    "output_preallocated",
     "warmup",
     "repeat",
     "requested_warmup",

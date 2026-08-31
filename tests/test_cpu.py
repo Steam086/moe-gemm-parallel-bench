@@ -11,6 +11,7 @@ from benchmark_moe import run_moe
 from kernels.grouped_gemm import grouped_candidate_configs
 from kernels.matmul import matmul_candidate_configs
 from plot_parallel_sweep import parse_run_spec
+from plot_results import _supported_moe_modes
 from utils.config import load_model_defaults
 from utils.io import CSV_FIELDS
 from utils.metrics import arithmetic_intensity, gemm_flops, moe_shapes, tile_metrics, verify_ep_tp_flops
@@ -127,11 +128,27 @@ class CpuMathTests(unittest.TestCase):
             "activation_in_timed_region",
             "scheduler",
             "cta_multiplier",
+            "output_preallocated",
             "best_measured_ratio",
             "near_best",
             "autotune_candidates_tested",
         ):
             self.assertIn(field, CSV_FIELDS)
+
+    def test_plot_filter_rejects_removed_moe_modes(self) -> None:
+        import pandas as pd
+
+        frame = pd.DataFrame(
+            [
+                {"mode": "grouped", "scheduler": "homogeneous_persistent"},
+                {"mode": "torch", "scheduler": "torch_grouped_mm"},
+                {"mode": "torch", "scheduler": "sequential_torch_mm"},
+                {"mode": "single", "scheduler": "single_problem_matmul"},
+            ]
+        )
+        supported = _supported_moe_modes(frame)
+        self.assertEqual(list(supported["mode"]), ["grouped", "torch"])
+        self.assertNotIn("sequential_torch_mm", set(supported["scheduler"]))
 
     def test_non_positive_cli_overrides_are_rejected(self) -> None:
         for option in ("--hidden-size", "--ffn-size", "--num-experts", "--topk", "--heatmap-k"):
@@ -162,6 +179,7 @@ class CpuMathTests(unittest.TestCase):
             "config_source": "workload_autotune",
             "scheduler": "homogeneous_persistent",
             "launches_per_iteration": "1",
+            "output_preallocated": "True",
             "block_m": "16",
             "block_n": "128",
             "block_k": "64",
@@ -172,6 +190,14 @@ class CpuMathTests(unittest.TestCase):
         self.assertTrue(_moe_execution_contract_valid(grouped))
         self.assertFalse(_moe_execution_contract_valid({**grouped, "mode": "single"}))
         self.assertFalse(_moe_execution_contract_valid({**grouped, "autotune_status": "not_run"}))
+        torch_grouped = {
+            "mode": "torch",
+            "scheduler": "torch_grouped_mm",
+            "launches_per_iteration": "1",
+            "output_preallocated": "False",
+        }
+        self.assertTrue(_moe_execution_contract_valid(torch_grouped))
+        self.assertFalse(_moe_execution_contract_valid({**torch_grouped, "scheduler": "sequential_torch_mm"}))
 
     def test_projection_contract_records_gate_up_fusion(self) -> None:
         gate_up = {

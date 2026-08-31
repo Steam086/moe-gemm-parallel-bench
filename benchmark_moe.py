@@ -16,6 +16,12 @@ from kernels.grouped_gemm import (
     launch_grouped,
 )
 from kernels.matmul import select_config
+from kernels.torch_grouped_gemm import (
+    TorchGroupedMMUnavailable,
+    build_torch_grouped_workspace,
+    launch_torch_grouped,
+    torch_grouped_mm_unavailable_reason,
+)
 from utils.benchmark import (
     assert_close,
     available_budget,
@@ -28,7 +34,17 @@ from utils.io import write_rows
 from utils.metrics import arithmetic_intensity, moe_shapes, tile_metrics, verify_ep_tp_flops
 
 
-def _estimate(shapes: list[tuple[int, int, int]], item_size: int) -> int:
+def _estimate(shapes: list[tuple[int, int, int]], item_size: int, mode: str) -> int:
+    if mode == "torch":
+        alignment = max(1, 16 // item_size)
+
+        def aligned(value: int) -> int:
+            return (value + alignment - 1) // alignment * alignment
+
+        data = sum(item_size * (m * aligned(k) + k * aligned(n) + m * n) for m, k, n in shapes)
+        # One int32 cumulative row offset per expert. grouped_mm returns its
+        # output, but the output storage is already included in ``data``.
+        return data + len(shapes) * 4
     data = sum(item_size * (m * k + k * n + m * n) for m, k, n in shapes)
     # Three pointer tables, dimensions, and six per-problem strides. Tile
     # assignment is computed on device and needs no host-built tile maps.
@@ -44,7 +60,7 @@ def _base(args, env, projection: str, parallel_type: str, mode: str, m: int, sha
     provider = "torch" if mode == "torch" else "triton"
     operation = "gate_up" if projection == "W1" else "down"
     row = {
-        "schema_version": "1.1",
+        "schema_version": "1.2",
         "run_id": args.run_id,
         "timestamp": args.timestamp,
         "gpu_name": env.get("gpu_name"),
@@ -84,7 +100,8 @@ def _base(args, env, projection: str, parallel_type: str, mode: str, m: int, sha
         "num_warps": cfg.num_warps,
         "num_stages": cfg.num_stages,
         **metrics,
-        "launches_per_iteration": 1 if mode == "grouped" else count,
+        "launches_per_iteration": 1,
+        "output_preallocated": mode != "torch",
         "autotune_enabled": mode != "torch",
         "autotune_status": "not_run" if mode != "torch" else "not_applicable",
         "config_source": "heuristic_fallback" if mode != "torch" else "library",
@@ -116,6 +133,11 @@ def _run_case(args, env: dict[str, Any], projection: str, parallel_type: str, mo
         projection, parallel_type, m, args.hidden_size, args.ffn_size, args.num_experts, args.parallel_size
     )
     row = _base(args, env, projection, parallel_type, mode, m, shapes[0], len(shapes), total)
+    if mode == "torch":
+        unavailable_reason = torch_grouped_mm_unavailable_reason()
+        if unavailable_reason:
+            row.update(status="skipped", skip_reason=unavailable_reason, error="")
+            return row
     # The previous case may have released its tensors after its final
     # empty_cache() call while the local workspace variable still held the
     # allocation.  Flush those now-unused cached blocks before asking the CUDA
@@ -123,7 +145,7 @@ def _run_case(args, env: dict[str, Any], projection: str, parallel_type: str, mo
     # parallel-size sweeps can incorrectly skip every case after the first.
     torch.cuda.empty_cache()
     budget = available_budget(args.memory_fraction)
-    per_workspace = _estimate(shapes, dtype_size(args.dtype))
+    per_workspace = _estimate(shapes, dtype_size(args.dtype), mode)
     requested_ring = 1 if args.cache_mode == "hot" else max(2, args.cold_buffers)
     ring = min(requested_ring, max(0, budget // max(per_workspace, 1)))
     if args.cache_mode == "hot":
@@ -145,10 +167,22 @@ def _run_case(args, env: dict[str, Any], projection: str, parallel_type: str, mo
     # Retry allocator failures with fewer rotating buffers; never alter GEMM shapes.
     while ring >= minimum_ring:
         try:
-            build_workspace = build_fused_gate_up_workspace if projection == "W1" else build_grouped_workspace
-            workspaces = [
-                build_workspace(shapes, dtype, args.seed + index * 100003, cfg) for index in range(ring)
-            ]
+            if mode == "torch":
+                operation = "gate_up" if projection == "W1" else "down"
+                workspaces = [
+                    build_torch_grouped_workspace(
+                        shapes,
+                        dtype,
+                        args.seed + index * 100003,
+                        operation=operation,
+                    )
+                    for index in range(ring)
+                ]
+            else:
+                build_workspace = build_fused_gate_up_workspace if projection == "W1" else build_grouped_workspace
+                workspaces = [
+                    build_workspace(shapes, dtype, args.seed + index * 100003, cfg) for index in range(ring)
+                ]
             break
         except torch.OutOfMemoryError:
             workspaces.clear()
@@ -201,13 +235,12 @@ def _run_case(args, env: dict[str, Any], projection: str, parallel_type: str, mo
                     autotune=args.cache_mode == "hot",
                 )
             else:
-                for a, b, c in zip(workspace.a, workspace.b, workspace.c):
-                    torch.mm(a, b, out=c)
+                launch_torch_grouped(workspace)
         torch.cuda.synchronize()
         max_abs = 0.0
         max_rel = 0.0
         for workspace in workspaces:
-            for a, b, c in zip(workspace.a, workspace.b, workspace.c):
+            for a, b, c in workspace.problem_tensors():
                 if projection == "W1":
                     local_ffn = b.shape[1] // 2
                     reference = torch.cat(
@@ -219,6 +252,7 @@ def _run_case(args, env: dict[str, Any], projection: str, parallel_type: str, mo
                 max_abs = max(max_abs, abs_error)
                 max_rel = max(max_rel, rel_error)
                 del reference
+        row["workspace_bytes"] = sum(workspace.storage_bytes for workspace in workspaces)
         if mode != "torch":
             cfg = workspaces[0].config
             row.update(
@@ -247,7 +281,7 @@ def _run_case(args, env: dict[str, Any], projection: str, parallel_type: str, mo
                     autotune_selection_ms=rotating_tuning.median_ms,
                 )
         else:
-            row["scheduler"] = "sequential_torch_mm"
+            row["scheduler"] = workspaces[0].scheduler
 
         def invoke(index: int) -> None:
             current = workspaces[index % ring]
@@ -259,8 +293,7 @@ def _run_case(args, env: dict[str, Any], projection: str, parallel_type: str, mo
                     autotune=args.cache_mode == "hot",
                 )
             else:
-                for aa, bb, cc in zip(current.a, current.b, current.c):
-                    torch.mm(aa, bb, out=cc)
+                launch_torch_grouped(current)
 
         timing = time_cuda(invoke, args.warmup, args.repeat, args.target_timing_ms)
         tflops = total / (timing.median_ms * 1e9)
@@ -284,6 +317,10 @@ def _run_case(args, env: dict[str, Any], projection: str, parallel_type: str, mo
     except AssertionError as exc:
         row.update(status="invalid", correct=False, error=f"correctness failure: {exc}", skip_reason="")
         print(f"INVALID {projection} {parallel_type} {mode} M={m}: {exc}")
+        torch.cuda.empty_cache()
+    except TorchGroupedMMUnavailable as exc:
+        row.update(status="skipped", correct=False, error="", skip_reason=str(exc))
+        print(f"SKIP {projection} {parallel_type} {mode} M={m}: {exc}")
         torch.cuda.empty_cache()
     except torch.OutOfMemoryError as exc:
         row.update(
