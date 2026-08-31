@@ -54,17 +54,17 @@ TP rank: num_experts   GEMMs of [M_e,F/P] @ [F/P,H]
 
 The Gate+Up timing covers the fused packed GEMM only. The following SiLU and
 elementwise `SiLU(gate) * up` are deliberately outside the timed region, as
-are routing and communication. The benchmark rejects non-divisible
-configurations and verifies exact per-rank FLOP equality before allocating GPU
-memory. W1/W3 therefore records twice the useful GEMM FLOPs of W2 for matching
-`M_e`, `H`, and `F`.
+are routing and communication. The MoE experiment rejects non-divisible
+configurations and verifies exact per-rank FLOP equality before allocating each
+case's GPU workspaces. W1/W3 therefore records twice the useful GEMM FLOPs of
+W2 for matching `M_e`, `H`, and `F`.
 
 ## Requirements
 
 - Linux
 - Python 3.10–3.12
 - an NVIDIA GPU and driver supported by the selected PyTorch build
-- PyTorch 2.13.x and Triton 3.7.1+
+- PyTorch 2.13.x and Triton `>=3.7.1,<3.8`
 
 Create and populate an environment with `uv`:
 
@@ -144,6 +144,8 @@ The standalone shape and heatmap experiments still use the single-GEMM Triton ke
 
 Grouped Triton autotuning uses a bounded workload-aware candidate set. It searches `BLOCK_M`, `BLOCK_N`, `BLOCK_K`, warp/stage counts, and persistent CTA count while accounting for problem count, total output tiles, padding, and the active device's SM count. Hot-mode candidates are measured by Triton's autotuner; cold-mode candidates are measured while rotating across the complete resident workspace ring. Compilation, autotuning, allocation, random initialization, reference calculation, and correctness checks occur before timing. Timed repetitions are enqueued back-to-back with CUDA events and synchronized once at the end, avoiding a host synchronization between every sample.
 
+`--warmup` (default 25) and `--repeat` (default 100) are requested counts. After an untimed pilot, warmups are capped to approximately 250 ms with a minimum of 2, and repetitions are capped toward `--target-timing-ms` (default 2000 ms) with a minimum of 3. The timing target is not a strict wall-clock limit. CSV rows store both requested and actual warmup/repetition counts.
+
 The PyTorch public grouped API returns a library-managed output and has no `out=` parameter. Before each repeated call the prior result is released, so after the untimed warmup PyTorch's caching allocator reuses the same output storage. CUDA events measure stream execution and exclude Python/host allocator bookkeeping. CSV rows record `output_preallocated=false` for this provider and `true` for the Triton provider.
 
 FP32 precision is explicit:
@@ -189,11 +191,13 @@ python validate_results.py --results-dir results --plots-dir plots
 ```
 
 Validation recomputes derivable FLOPs and TFLOPS, checks the packed Gate+Up and
-Down projection contracts, verifies correctness/status fields and matched MoE
-FLOPs, requires every successful Triton MoE row to record a selected
-workload-aware grouped configuration, requires the PyTorch MoE row to record
-one `torch_grouped_mm` launch, rejects the removed MoE `single` and sequential
-torch modes, and checks generated PNG signatures/counts.
+Down projection contracts, verifies correctness and metrics for `status=ok`
+rows, treats `status=invalid` and `status=error` rows as failures, counts
+`status=skipped` rows, and verifies matched MoE FLOPs. Every successful Triton
+MoE row must record a selected workload-aware grouped configuration, and every
+successful PyTorch MoE row must record one `torch_grouped_mm` launch. Validation
+rejects the removed MoE `single` and sequential torch modes and checks generated
+PNG signatures/counts.
 
 ## Parallel-size sweeps
 
