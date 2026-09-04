@@ -380,26 +380,21 @@ if _runtime_ready():
             offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
             offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
             offs_k = tl.arange(0, BLOCK_K)
-            # Map only out-of-bounds edge lanes to a valid row/column. This
-            # removes M/N masks from every K-loop load while the final store
-            # remains masked. The pattern also gives Triton useful contiguity
-            # information for this contiguous homogeneous fast path.
-            load_m = tl.where(offs_m < M, offs_m, 0)
-            load_n = tl.where(offs_n < N, offs_n, 0)
-            load_m = tl.max_contiguous(tl.multiple_of(load_m, BLOCK_M), BLOCK_M)
-            load_n = tl.max_contiguous(tl.multiple_of(load_n, BLOCK_N), BLOCK_N)
-            a_tile = a_ptr + load_m[:, None] * K + offs_k[None, :]
-            b_tile = b_ptr + offs_k[:, None] * N + load_n[None, :]
+            # Keep true consecutive indices. Replacing edge lanes with zero
+            # invalidates max_contiguous hints and can miscompile vector loads.
+            # constexpr divisibility removes M/N predicates for aligned shapes.
+            a_tile = a_ptr + offs_m[:, None] * K + offs_k[None, :]
+            b_tile = b_ptr + offs_k[:, None] * N + offs_n[None, :]
             accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
             for k_start in range(0, K, BLOCK_K):
                 a = tl.load(
                     a_tile,
-                    mask=k_start + offs_k[None, :] < K,
+                    mask=((M % BLOCK_M == 0) | (offs_m[:, None] < M)) & (k_start + offs_k[None, :] < K),
                     other=0.0,
                 )
                 b = tl.load(
                     b_tile,
-                    mask=k_start + offs_k[:, None] < K,
+                    mask=(k_start + offs_k[:, None] < K) & ((N % BLOCK_N == 0) | (offs_n[None, :] < N)),
                     other=0.0,
                 )
                 accumulator += tl.dot(a, b, input_precision=INPUT_PRECISION)

@@ -245,6 +245,14 @@ def _run_case(args, env: dict[str, Any], projection: str, parallel_type: str, mo
             else:
                 launch_torch_grouped(workspace)
         torch.cuda.synchronize()
+        if mode == "grouped":
+            # Autotuning writes C with multiple candidates. Poison it and launch
+            # the winner alone, so a partial write cannot inherit valid output.
+            for workspace in workspaces:
+                for output in workspace.c:
+                    output.fill_(float("nan"))
+                launch_grouped(workspace, args.input_precision, workspace.config, autotune=False)
+            torch.cuda.synchronize()
         max_abs = 0.0
         max_rel = 0.0
         for workspace in workspaces:

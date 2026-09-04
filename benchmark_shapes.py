@@ -168,6 +168,12 @@ def _run_one(args, env, m: int, k: int, n: int, experiment: str) -> list[dict[st
                 autotune=args.cache_mode == "hot",
             )
         torch.cuda.synchronize()
+        if args.cache_mode == "hot":
+            cfg = last_matmul_config(cfg)
+        for a, b, c in workspaces:
+            c.fill_(float("nan"))
+            launch_matmul(a, b, c, cfg, args.input_precision, autotune=False)
+        torch.cuda.synchronize()
         max_abs = 0.0
         max_rel = 0.0
         for a, b, c in workspaces:

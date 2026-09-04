@@ -153,7 +153,7 @@ FP32 precision is explicit:
 - `--input-precision ieee` disables TF32 for the PyTorch baseline and requests IEEE input precision from Triton;
 - `--input-precision tf32` requires `--dtype fp32` and enables the matching PyTorch policy.
 
-Every resident rotating-cold workspace is correctness-checked before timing.
+Every resident workspace is correctness-checked before timing. After autotuning, Triton outputs are filled with NaNs and the selected configuration is launched alone before reference comparison, preventing stale candidate output from hiding omitted writes. Homogeneous kernels keep consecutive indices and mask M/N/K tails; they do not assert false contiguity for wrapped edge indices.
 
 ### Cache regimes
 

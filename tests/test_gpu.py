@@ -8,8 +8,13 @@ try:
 except ImportError:
     torch = None
 
-from kernels.grouped_gemm import build_fused_gate_up_workspace, build_grouped_workspace, launch_grouped
-from kernels.matmul import last_matmul_config, launch_matmul, select_config
+from kernels.grouped_gemm import (
+    build_fused_gate_up_workspace,
+    build_grouped_workspace,
+    grouped_candidate_configs,
+    launch_grouped,
+)
+from kernels.matmul import KernelConfig, last_matmul_config, launch_matmul, select_config
 from kernels.torch_grouped_gemm import (
     build_torch_grouped_workspace,
     launch_torch_grouped,
@@ -96,6 +101,55 @@ class TritonCorrectnessTests(unittest.TestCase):
         self.assertEqual(workspace.scheduler, "homogeneous_persistent")
         for a, b, c in zip(workspace.a, workspace.b, workspace.c):
             assert_close(c, a @ b, "fp16")
+
+    def test_homogeneous_tail_candidates_write_every_output(self) -> None:
+        from triton.runtime.errors import OutOfResources
+
+        for dtype in (torch.float16, torch.bfloat16, torch.float32):
+            if dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+                continue
+            for shape in ((1, 1, 1), (17, 33, 65)):
+                workspace = build_grouped_workspace([shape] * 3, dtype)
+                # Exact integer results expose wrong indexing and omitted writes
+                # without relying on the random-small-input absolute tolerance.
+                for index, (a, b, _) in enumerate(workspace.problem_tensors()):
+                    a.fill_(1)
+                    b.fill_(index + 1)
+                m, k, n = shape
+                candidates = grouped_candidate_configs(m, n, k, problem_count=3, sm_count=workspace.sm_count)
+                successful = 0
+                for config in candidates:
+                    for output in workspace.c:
+                        output.fill_(float("nan"))
+                    try:
+                        launch_grouped(workspace, config=config, autotune=False)
+                    except OutOfResources:
+                        continue
+                    torch.cuda.synchronize()
+                    for index, output in enumerate(workspace.c):
+                        torch.testing.assert_close(output, torch.full_like(output, k * (index + 1)), rtol=0, atol=0)
+                    successful += 1
+                self.assertGreater(successful, 0)
+
+    def test_homogeneous_persistent_multiple_rounds_and_guard_storage(self) -> None:
+        config = KernelConfig(16, 32, 32, 4, 4, 2)
+        sm_count = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+        m, k, n = (sm_count + 1) * config.block_m + 1, 33, 65
+        workspace = build_grouped_workspace([(m, k, n)] * 2, torch.float32)
+        guards = []
+        for index in range(workspace.problem_count):
+            storage = torch.full((m * n + 32,), float("nan"), device=workspace.c[index].device)
+            output = storage[16:-16].view(m, n)
+            guards.append(storage)
+            workspace.c[index] = output
+            workspace.c_ptrs[index] = output.data_ptr()
+        launch_grouped(workspace, config=config, autotune=False)
+        torch.cuda.synchronize()
+        for (a, b, c), storage in zip(workspace.problem_tensors(), guards):
+            reference = (a.double() @ b.double()).float()
+            torch.testing.assert_close(c, reference, rtol=1e-4, atol=1e-6)
+            self.assertTrue(torch.isnan(storage[:16]).all())
+            self.assertTrue(torch.isnan(storage[-16:]).all())
 
     def test_fused_gate_up_packed_output_in_one_grouped_launch(self) -> None:
         local_ffn = 31
