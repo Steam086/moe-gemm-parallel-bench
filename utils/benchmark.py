@@ -246,6 +246,18 @@ def tune_rotating_configs(
     return TuningResult(best_config, best_median, tested, failed)
 
 
+def hot_autotune_bench(function: Callable[[], None], quantiles):
+    """Bounded hot candidate timing, using the same device-only graph method.
+
+    Triton's default do_bench clears L2 before each sample. That selects for a
+    different cache regime and spends ~100 ms per candidate. Nine samples with
+    a 25 ms target bound measurement work; compilation remains uncapped.
+    """
+    timing = time_cuda(lambda _: function(), 2, 9, target_ms=25.0)
+    values = {0.2: timing.p20_ms, 0.5: timing.median_ms, 0.8: timing.p80_ms}
+    return [values[quantile] for quantile in quantiles]
+
+
 def assert_close(actual, reference, dtype_name: str) -> tuple[float, float]:
     import torch
 

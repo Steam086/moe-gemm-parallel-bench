@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
+from utils.benchmark import hot_autotune_bench
+
 try:
     import torch
     import triton
@@ -79,7 +81,43 @@ _MATMUL_CONFIG_POOL: tuple[KernelConfig, ...] = (
     KernelConfig(256, 64, 32, 8, 8, 3),
     KernelConfig(256, 64, 64, 8, 8, 4),
     KernelConfig(256, 128, 64, 8, 8, 4),
+    # Complete the portable fallback family and expose deeper/shallower
+    # pipelines. Only a bounded diverse subset is compiled for any one shape.
+    KernelConfig(16, 32, 32, 4, 2, 2),
+    KernelConfig(16, 128, 32, 4, 2, 2),
+    KernelConfig(32, 32, 32, 4, 2, 3),
+    KernelConfig(32, 64, 32, 4, 2, 3),
+    KernelConfig(32, 128, 32, 4, 2, 3),
+    KernelConfig(16, 128, 64, 4, 4, 2),
+    KernelConfig(32, 128, 64, 4, 4, 5),
+    KernelConfig(64, 128, 64, 4, 4, 2),
+    KernelConfig(64, 128, 64, 4, 4, 5),
+    KernelConfig(64, 128, 64, 8, 4, 3),
+    KernelConfig(128, 128, 64, 4, 4, 3),
+    KernelConfig(128, 128, 64, 8, 8, 5),
 )
+
+
+def diverse_configs(ordered: list[KernelConfig], limit: int) -> list[KernelConfig]:
+    """Greedy coverage of tile, warp, pipeline and traversal choices.
+
+    Analytical rank breaks ties. Unlike rank-only truncation, a stage/warp
+    variant has a chance to survive even when its tile shape is identical.
+    """
+    def features(config):
+        return {(name, getattr(config, name)) for name in (
+            "block_m", "block_n", "block_k", "num_warps", "num_stages", "group_size_m",
+        )}
+
+    remaining = list(dict.fromkeys(ordered))
+    selected = []
+    covered = set()
+    while remaining and len(selected) < max(1, limit):
+        config = max(remaining, key=lambda candidate: len(features(candidate) - covered))
+        selected.append(config)
+        covered.update(features(config))
+        remaining.remove(config)
+    return selected
 
 
 def _family_limits(m: int, n: int) -> tuple[set[int], set[int]]:
@@ -125,7 +163,7 @@ def matmul_candidate_configs(m: int, n: int, k: int, limit: int = 10) -> tuple[K
         return (-(output_efficiency - k_penalty), cfg.block_m * cfg.block_n, cfg.block_k)
 
     ordered = sorted(dict.fromkeys(candidates), key=rank)
-    selected = ordered[: max(1, limit)]
+    selected = diverse_configs(ordered, limit)
     low_resource = next((cfg for cfg in ordered if cfg.num_warps == 2), None)
     if low_resource is not None and low_resource not in selected:
         selected[-1] = low_resource
@@ -236,6 +274,7 @@ if _runtime_ready():
 
     _matmul_kernel = triton.autotune(
         configs=_triton_configs,
+        do_bench=hot_autotune_bench,
         key=[
             "m",
             "n",

@@ -213,6 +213,8 @@ def main(argv: list[str] | None = None) -> int:
         "device": args.device,
         "torch_fp32_matmul_precision": "tf32" if args.input_precision == "tf32" else "ieee",
         "triton_autotune": True,
+        "grouped_base_candidate_limit": 12,
+        "hot_autotune_timing": "cuda_graph_hot_9_samples_25ms_target",
         "standalone_gemm_autotune_scope": "shape-family BLOCK_M/BLOCK_N/BLOCK_K/GROUP_M/num_warps/num_stages",
         "grouped_autotune_scope": "workload-aware BLOCK_M/BLOCK_N/BLOCK_K/GROUP_M/CTA multiplier/num_warps/num_stages",
         "torch_moe_baseline": "profiler-verified torch.nn.functional.grouped_mm; sequential fallback excluded",

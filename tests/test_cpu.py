@@ -9,7 +9,7 @@ from unittest.mock import patch
 from benchmark import main, parser
 from benchmark_moe import run_moe
 from kernels.grouped_gemm import grouped_candidate_configs
-from kernels.matmul import matmul_candidate_configs
+from kernels.matmul import _MATMUL_CONFIG_POOL, matmul_candidate_configs
 from kernels.torch_grouped_gemm import TorchGroupedMMUnavailable, inspect_grouped_trace
 from plot_parallel_sweep import parse_run_spec
 from plot_results import _supported_moe_modes
@@ -109,14 +109,32 @@ class CpuMathTests(unittest.TestCase):
         self.assertTrue(any(cfg.block_k == 128 for cfg in wide))
         self.assertTrue(any(cfg.block_m == 256 for cfg in skinny_n))
         grouped = grouped_candidate_configs(16, 256, 7168, problem_count=256, sm_count=120)
-        self.assertLessEqual(len(grouped), 24)
+        self.assertLessEqual(len(grouped), 36)
         self.assertEqual({cfg.block_m for cfg in grouped}, {16, 32, 64})
         self.assertEqual({cfg.block_n for cfg in grouped}, {64, 128, 256})
         self.assertEqual({cfg.block_k for cfg in grouped}, {32, 64, 128})
         self.assertEqual({cfg.num_warps for cfg in grouped}, {2, 4, 8})
         self.assertEqual({cfg.cta_multiplier for cfg in grouped}, {1, 2, 4})
+        self.assertEqual({cfg.num_stages for cfg in grouped}, {2, 3, 4, 5})
+        self.assertEqual({cfg.group_size_m for cfg in grouped}, {1, 4, 8})
         one_problem = grouped_candidate_configs(16, 256, 7168, problem_count=1, sm_count=120)
         self.assertEqual({cfg.cta_multiplier for cfg in one_problem}, {1})
+
+    def test_candidates_exist_in_decorator_pools_and_respect_budgets(self) -> None:
+        from kernels.grouped_gemm import _GROUPED_BASE_CONFIG_POOL
+        from kernels.matmul import KernelConfig
+
+        for m in (1, 16, 32, 64, 128, 512):
+            for n in (3, 32, 64, 128, 512):
+                for k in (1, 32, 128, 8192):
+                    for config in matmul_candidate_configs(m, n, k):
+                        self.assertIn(config, _MATMUL_CONFIG_POOL)
+                    candidates = grouped_candidate_configs(m, n, k, problem_count=8, sm_count=16)
+                    self.assertLessEqual(len(candidates), 36)
+                    self.assertEqual(len(candidates), len(set(candidates)))
+                    for config in candidates:
+                        base = KernelConfig(**{**config.as_dict(), "cta_multiplier": 1})
+                        self.assertIn(base, _GROUPED_BASE_CONFIG_POOL)
 
     def test_moe_experiment_has_no_single_mode(self) -> None:
         args = SimpleNamespace(

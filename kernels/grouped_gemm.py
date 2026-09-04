@@ -14,6 +14,8 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from utils.benchmark import hot_autotune_bench
+
 try:
     import torch
     import triton
@@ -26,6 +28,7 @@ except ImportError:
 from .matmul import (
     _MATMUL_CONFIG_POOL,
     KernelConfig,
+    diverse_configs,
     last_matmul_config,
     launch_matmul,
     matmul_candidate_configs,
@@ -46,6 +49,17 @@ _GROUPED_EXTRA_CONFIG_POOL: tuple[KernelConfig, ...] = (
     KernelConfig(64, 32, 64, 4, 4, 3),
     KernelConfig(64, 256, 128, 4, 8, 4),
     KernelConfig(128, 128, 128, 8, 8, 4),
+    KernelConfig(16, 64, 128, 1, 4, 2),
+    KernelConfig(16, 128, 64, 1, 4, 5),
+    KernelConfig(32, 128, 128, 1, 4, 2),
+    KernelConfig(32, 256, 64, 4, 8, 5),
+    KernelConfig(64, 128, 128, 1, 4, 3),
+    KernelConfig(128, 128, 128, 4, 8, 3),
+    # Portable tile families from tutorial 08, plus M-grouped traversal.
+    KernelConfig(64, 64, 32, 1, 4, 3),
+    KernelConfig(128, 128, 32, 1, 4, 3),
+    KernelConfig(128, 128, 64, 1, 4, 3),
+    KernelConfig(64, 128, 64, 1, 4, 3),
 )
 _GROUPED_BASE_CONFIG_POOL = tuple(dict.fromkeys((*_MATMUL_CONFIG_POOL, *_GROUPED_EXTRA_CONFIG_POOL)))
 
@@ -101,7 +115,7 @@ def grouped_candidate_configs(
     max_m: int,
     max_n: int,
     max_k: int,
-    base_limit: int = 8,
+    base_limit: int = 12,
     *,
     problem_count: int = 1,
     sm_count: int = 0,
@@ -185,32 +199,7 @@ def grouped_candidate_configs(
 
     ordered = sorted(dict.fromkeys(base), key=rank)
 
-    # Preserve diversity across the dimensions that materially change tensor
-    # core utilization and occupancy, then fill the remaining bounded budget by
-    # the analytical rank above. Actual hardware timing still chooses the
-    # winner.
-    selected_base: list[KernelConfig] = []
-
-    def add_first(predicate) -> None:
-        candidate = next((cfg for cfg in ordered if predicate(cfg)), None)
-        if candidate is not None and candidate not in selected_base:
-            selected_base.append(candidate)
-
-    for block_m in sorted(block_ms):
-        add_first(lambda cfg, value=block_m: cfg.block_m == value)
-    for block_n in sorted(block_ns):
-        add_first(lambda cfg, value=block_n: cfg.block_n == value)
-    for block_k in (32, 64, 128):
-        if block_k <= max_k:
-            add_first(lambda cfg, value=block_k: cfg.block_k == value)
-    for warps in (2, 4, 8):
-        add_first(lambda cfg, value=warps: cfg.num_warps == value)
-    for cfg in ordered:
-        if cfg not in selected_base:
-            selected_base.append(cfg)
-        if len(selected_base) >= max(1, base_limit):
-            break
-    selected_base = selected_base[: max(1, base_limit)]
+    selected_base = diverse_configs(ordered, base_limit)
 
     candidates: list[KernelConfig] = []
     for cfg in selected_base:
@@ -503,11 +492,13 @@ if _runtime_ready():
     ]
     _homogeneous_grouped_kernel = triton.autotune(
         configs=_grouped_triton_configs,
+        do_bench=hot_autotune_bench,
         key=["M", "N", "K", "PROBLEM_COUNT", *_common_key],
         prune_configs_by={"early_config_prune": _prune_grouped_configs},
     )(_homogeneous_grouped_kernel_impl)
     _generic_grouped_kernel = triton.autotune(
         configs=_grouped_triton_configs,
+        do_bench=hot_autotune_bench,
         key=["problem_count", *_common_key],
         prune_configs_by={"early_config_prune": _prune_grouped_configs},
     )(_generic_grouped_kernel_impl)
