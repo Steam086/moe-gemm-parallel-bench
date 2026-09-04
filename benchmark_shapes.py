@@ -12,6 +12,7 @@ from kernels.matmul import (
     select_config,
 )
 from utils.benchmark import (
+    TIMING_METHOD,
     assert_close,
     available_budget,
     dtype_size,
@@ -25,7 +26,8 @@ from utils.metrics import arithmetic_intensity, gemm_flops, tile_metrics
 
 def _base(args, env: dict[str, Any], experiment: str) -> dict[str, Any]:
     return {
-        "schema_version": "1.0",
+        "schema_version": "1.3",
+        "timing_method": TIMING_METHOD,
         "run_id": args.run_id,
         "timestamp": args.timestamp,
         "gpu_name": env.get("gpu_name"),
@@ -205,7 +207,7 @@ def _run_one(args, env, m: int, k: int, n: int, experiment: str) -> list[dict[st
                 autotune=args.cache_mode == "hot",
             )
 
-        timing = time_cuda(triton_call, args.warmup, args.repeat, args.target_timing_ms)
+        timing = time_cuda(triton_call, args.warmup, args.repeat, args.target_timing_ms, workspace_count=ring)
         tflops = gemm_flops(m, k, n) / (timing.median_ms * 1e9)
         triton_row = dict(base)
         triton_row.update(
@@ -243,7 +245,7 @@ def _run_one(args, env, m: int, k: int, n: int, experiment: str) -> list[dict[st
                 aa, bb, cc = workspaces[index % ring]
                 torch.mm(aa, bb, out=cc)
 
-            torch_timing = time_cuda(torch_call, args.warmup, args.repeat, args.target_timing_ms)
+            torch_timing = time_cuda(torch_call, args.warmup, args.repeat, args.target_timing_ms, workspace_count=ring)
             torch_tflops = gemm_flops(m, k, n) / (torch_timing.median_ms * 1e9)
             torch_row = dict(triton_row)
             torch_row.update(

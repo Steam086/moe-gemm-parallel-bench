@@ -23,6 +23,7 @@ from kernels.torch_grouped_gemm import (
     torch_grouped_mm_unavailable_reason,
 )
 from utils.benchmark import (
+    TIMING_METHOD,
     assert_close,
     available_budget,
     dtype_size,
@@ -60,7 +61,8 @@ def _base(args, env, projection: str, parallel_type: str, mode: str, m: int, sha
     provider = "torch" if mode == "torch" else "triton"
     operation = "gate_up" if projection == "W1" else "down"
     row = {
-        "schema_version": "1.2",
+        "schema_version": "1.3",
+        "timing_method": TIMING_METHOD,
         "run_id": args.run_id,
         "timestamp": args.timestamp,
         "gpu_name": env.get("gpu_name"),
@@ -295,7 +297,7 @@ def _run_case(args, env: dict[str, Any], projection: str, parallel_type: str, mo
             else:
                 launch_torch_grouped(current)
 
-        timing = time_cuda(invoke, args.warmup, args.repeat, args.target_timing_ms)
+        timing = time_cuda(invoke, args.warmup, args.repeat, args.target_timing_ms, workspace_count=ring)
         tflops = total / (timing.median_ms * 1e9)
         row.update(
             status="ok",

@@ -12,6 +12,7 @@ MOE_MODES = {"grouped", "torch"}
 PROJECTION_LABELS = {"W1": "W1/W3 Gate+Up", "W2": "W2 Down"}
 
 CONSISTENT_EFFECTIVE_PARAMETERS = (
+    "timing_method",
     "hidden_size",
     "ffn_size",
     "num_experts",

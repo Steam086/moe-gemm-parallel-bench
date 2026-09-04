@@ -21,6 +21,7 @@ class TimingResult:
 
 
 ConfigT = TypeVar("ConfigT")
+TIMING_METHOD = "cuda_graph_events"
 
 
 @dataclass(frozen=True)
@@ -114,39 +115,78 @@ def percentile(values: Sequence[float], q: float) -> float:
     return ordered[lo] * (hi - pos) + ordered[hi] * (pos - lo)
 
 
-def time_cuda(
-    function: Callable[[int], None], requested_warmup: int, requested_repeat: int, target_ms: float = 2000.0
-) -> TimingResult:
-    """Measure back-to-back CUDA stream execution with CUDA events.
+def _whole_ring_count(requested: int, minimum: int, workspace_count: int) -> int:
+    """Round upward so even short measurements visit the entire cold ring."""
+    return math.ceil(max(minimum, requested) / workspace_count) * workspace_count
 
-    Indexing permits rotating resident workspaces. Callers compile, autotune,
-    and warm any library-managed caching-allocator storage before measured
-    samples. All measured work is enqueued before one final synchronization so
-    each repetition is not forced into an artificial empty-stream
-    request/response cycle.
+
+def _capture_samples(function: Callable[[int], None], count: int, workspace_count: int, stream):
+    """Capture event nodes around calls, not around host-side graph submission.
+
+    External events become explicit graph nodes. A replay therefore executes
+    every start/kernel/end sequence on the device with no Python between them.
+    Inputs and library allocator storage must already be warmed on ``stream``.
     """
     import torch
 
-    function(0)  # compile/autotune outside timing
-    torch.cuda.synchronize()
-    pilot_start, pilot_end = torch.cuda.Event(True), torch.cuda.Event(True)
-    pilot_start.record()
-    function(0)
-    pilot_end.record()
-    pilot_end.synchronize()
-    pilot_ms = max(pilot_start.elapsed_time(pilot_end), 0.001)
+    events = [
+        (torch.cuda.Event(enable_timing=True, external=True), torch.cuda.Event(enable_timing=True, external=True))
+        for _ in range(count)
+    ]
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        for index, (start, end) in enumerate(events):
+            start.record()
+            function(index % workspace_count)
+            end.record()
+    return graph, events
+
+
+def _replay_samples(graph, events, stream) -> list[float]:
+    import torch
+
+    with torch.cuda.stream(stream):
+        graph.replay()
+    stream.synchronize()
+    return [start.elapsed_time(end) for start, end in events]
+
+
+def time_cuda(
+    function: Callable[[int], None], requested_warmup: int, requested_repeat: int, target_ms: float = 2000.0,
+    *, workspace_count: int = 1,
+) -> TimingResult:
+    """Measure device execution inside one CUDA Graph replay.
+
+    Capture, Python dispatch, compilation, allocation and warmup are untimed.
+    Each sample is bounded by event nodes *inside* the graph, so CPU submission
+    starvation cannot inflate it. Cold samples traverse complete workspace rings.
+    Capture failures propagate; there is no eager timing fallback.
+    """
+    import torch
+
+    if workspace_count < 1 or requested_warmup < 0 or requested_repeat < 1 or target_ms <= 0:
+        raise ValueError("invalid CUDA graph timing counts or target")
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for index in range(workspace_count):
+            function(index)  # compile/autotune and allocator warmup outside capture
+    stream.synchronize()
+    pilot, pilot_events = _capture_samples(function, workspace_count, workspace_count, stream)
+    pilot_ms = max(statistics.median(_replay_samples(pilot, pilot_events, stream)), 0.001)
     warmup = max(2, min(requested_warmup, int(max(2.0, 250.0 / pilot_ms))))
     repeat = max(3, min(requested_repeat, int(max(3.0, target_ms / pilot_ms))))
-    for index in range(warmup):
-        function(index)
-    torch.cuda.synchronize()
-    events = [(torch.cuda.Event(True), torch.cuda.Event(True)) for _ in range(repeat)]
-    for index, (start, end) in enumerate(events):
-        start.record()
-        function(index)
-        end.record()
-    events[-1][1].synchronize()
-    samples = [start.elapsed_time(end) for start, end in events]
+    warmup = _whole_ring_count(warmup, 2, workspace_count)
+    repeat = _whole_ring_count(repeat, 3, workspace_count)
+    with torch.cuda.stream(stream):
+        for _ in range(warmup // workspace_count):
+            pilot.replay()
+    stream.synchronize()
+    del pilot, pilot_events
+    graph, events = _capture_samples(function, repeat, workspace_count, stream)
+    # Warm the instantiated graph and its private allocator pool before sampling.
+    _replay_samples(graph, events, stream)
+    samples = _replay_samples(graph, events, stream)
     return TimingResult(
         p20_ms=percentile(samples, 0.2),
         median_ms=statistics.median(samples),
@@ -188,18 +228,10 @@ def tune_rotating_configs(
     sample_count = max(3, workspace_count * max(1, repeats_per_workspace))
     for config in configs:
         try:
-            launch(config, 0)  # compile outside candidate timing
-            torch.cuda.synchronize()
-            for index in range(workspace_count):
-                launch(config, index)
-            torch.cuda.synchronize()
-            events = [(torch.cuda.Event(True), torch.cuda.Event(True)) for _ in range(sample_count)]
-            for index, (start, end) in enumerate(events):
-                start.record()
-                launch(config, index % workspace_count)
-                end.record()
-            events[-1][1].synchronize()
-            candidate_median = statistics.median(start.elapsed_time(end) for start, end in events)
+            timing = time_cuda(
+                lambda index: launch(config, index), 2, sample_count, workspace_count=workspace_count,
+            )
+            candidate_median = timing.median_ms
             tested += 1
             if candidate_median < best_median:
                 best_config = config

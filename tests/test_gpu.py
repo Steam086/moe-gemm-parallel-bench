@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import unittest
 
 try:
@@ -10,13 +11,28 @@ except ImportError:
 from kernels.grouped_gemm import build_fused_gate_up_workspace, build_grouped_workspace, launch_grouped
 from kernels.matmul import last_matmul_config, launch_matmul, select_config
 from kernels.torch_grouped_gemm import build_torch_grouped_workspace, launch_torch_grouped
-from utils.benchmark import assert_close
+from utils.benchmark import assert_close, time_cuda
 
 
 @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "CUDA PyTorch unavailable")
 class TritonCorrectnessTests(unittest.TestCase):
     def setUp(self) -> None:
         torch.manual_seed(7)
+
+    def test_graph_timing_excludes_host_delay_and_visits_cold_ring(self) -> None:
+        outputs = [torch.zeros(16, device="cuda") for _ in range(4)]
+
+        def delayed_launch(index):
+            time.sleep(0.02)
+            outputs[index].add_(1)
+
+        result = time_cuda(delayed_launch, 2, 3, workspace_count=len(outputs))
+        self.assertEqual(result.repeat, 4)
+        # All buffers see the same replay count, including when repeat < ring.
+        self.assertTrue(all(torch.equal(outputs[0], other) for other in outputs))
+        self.assertGreater(outputs[0][0].item(), 1)
+        # A 20 ms host sleep must not become a device sample.
+        self.assertLess(result.median_ms, 10)
 
     def test_single_odd_shapes_all_dtypes(self) -> None:
         dtypes = (("fp16", torch.float16), ("bf16", torch.bfloat16), ("fp32", torch.float32))

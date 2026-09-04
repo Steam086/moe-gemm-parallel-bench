@@ -35,6 +35,7 @@ CSV_FIELDS = [
     "num_gemms",
     "active_gemms",
     "total_flops",
+    "timing_method",
     "latency_ms",
     "latency_p20_ms",
     "latency_p80_ms",

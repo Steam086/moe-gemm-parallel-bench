@@ -14,6 +14,7 @@ from benchmark_moe import run_moe
 from benchmark_shapes import run_heatmap, run_shape_sweep
 from plot_results import plot_all
 from utils.benchmark import (
+    TIMING_METHOD,
     configure_torch_matmul,
     dtype_supported,
     select_cuda_device,
@@ -97,7 +98,8 @@ def parser() -> argparse.ArgumentParser:
 
 def _unsupported_row(args, env: dict[str, Any], experiment: str, reason: str, projection: str = "") -> dict[str, Any]:
     return {
-        "schema_version": "1.1",
+        "schema_version": "1.3",
+        "timing_method": TIMING_METHOD,
         "run_id": args.run_id,
         "timestamp": args.timestamp,
         "gpu_name": env.get("gpu_name"),
@@ -197,6 +199,7 @@ def main(argv: list[str] | None = None) -> int:
         key: _public_argument(key, value) for key, value in requested.items() if key != "model_defaults"
     }
     args.effective_parameters = {
+        "timing_method": TIMING_METHOD,
         "hidden_size": args.hidden_size,
         "ffn_size": args.ffn_size,
         "num_experts": args.num_experts,

@@ -12,6 +12,7 @@ from kernels.grouped_gemm import grouped_candidate_configs
 from kernels.matmul import matmul_candidate_configs
 from plot_parallel_sweep import parse_run_spec
 from plot_results import _supported_moe_modes
+from utils.benchmark import _whole_ring_count
 from utils.config import load_model_defaults
 from utils.io import CSV_FIELDS
 from utils.metrics import arithmetic_intensity, gemm_flops, moe_shapes, tile_metrics, verify_ep_tp_flops
@@ -19,6 +20,11 @@ from validate_results import _derivable_metrics_valid, _moe_execution_contract_v
 
 
 class CpuMathTests(unittest.TestCase):
+    def test_timing_counts_visit_complete_workspace_rings(self) -> None:
+        self.assertEqual(_whole_ring_count(1, 3, 8), 8)
+        self.assertEqual(_whole_ring_count(5, 3, 2), 6)
+        self.assertEqual(_whole_ring_count(100, 3, 1), 100)
+
     def test_deepseek_v3_mapping(self) -> None:
         config = load_model_defaults("model_configs/deepseek-v3.json")
         self.assertEqual(config.hidden_size, 7168)
