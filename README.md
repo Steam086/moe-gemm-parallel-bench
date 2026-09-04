@@ -258,6 +258,40 @@ python benchmark.py --experiment moe --moe-ms 16,32 --repeat 5 --warmup 2 --no-p
 
 The representative MoE run is also the minimum performance sanity check for grouped tile selection and autotuning; inspect the selected configuration, scheduler, latency, and the optional native PyTorch grouped baseline in its CSV output. GPU tests are skipped when CUDA PyTorch is unavailable. See [`AGENTS.md`](AGENTS.md) for contributor and automated-agent guidance.
 
+## Official Grouped GEMM comparison
+
+Run the independent comparison against the pinned, unmodified portable kernel
+from [Triton tutorial 08, v3.7.1](https://github.com/triton-lang/triton/blob/v3.7.1/python/tutorials/08-grouped-gemm.py):
+
+```bash
+python compare_grouped_gemm.py
+python compare_grouped_gemm.py --cache-mode cold --cold-buffers 2
+python compare_grouped_gemm.py --shape 128,7168,4096 --experts 32
+python compare_grouped_gemm.py --moe-config model_configs/deepseek-v3.json \
+  --parallel-size 8 --moe-ms 128,256
+```
+
+Defaults cover homogeneous, heterogeneous, and multi-round persistent workloads.
+Both implementations use exactly the same resident A/B/C buffers, useful FLOPs,
+FP16 inputs, and CUDA Graph timing. Every measured candidate is checked against
+an FP32 reference after poisoning outputs. Both searches remeasure at most three
+finalists, and final measurements reverse provider order in a second round.
+The tutorial's four portable tile families use device-relative grids instead of
+its fixed machine-specific CTA counts. Its kernel has no masks, so unsupported
+tail shapes are explicitly skipped without changing logical dimensions. This
+comparison does not include the tutorial's separate TMA kernel.
+
+The JSON report defaults to `results/grouped_tutorial_comparison.json`. It records
+source hashes, hardware/software, selected configurations, candidate counts,
+correctness errors, timings, and `project_over_tutorial_latency` (lower is better).
+Use `--max-slowdown 1.10` to fail if the project exceeds tutorial latency by more
+than 10% on a measured point. No performance threshold is assumed by default.
+Exit codes are 0 for measured success, 2 for a correctness/runtime/threshold
+failure, and 3 when every case is skipped, including when CUDA is unavailable.
+Skipped cases are never evidence of correctness or speed; inspect their reasons.
+An AST checksum CPU test guards the copied tutorial kernel, and GPU tests compare
+both kernels with matching configurations on homogeneous and heterogeneous inputs.
+
 ## Limitations
 
 - synthetic dense FP16/BF16/FP32 data only;

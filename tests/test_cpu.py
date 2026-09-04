@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import ast
+import hashlib
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,6 +13,7 @@ from benchmark_moe import run_moe
 from kernels.grouped_gemm import grouped_candidate_configs
 from kernels.matmul import _MATMUL_CONFIG_POOL, matmul_candidate_configs
 from kernels.torch_grouped_gemm import TorchGroupedMMUnavailable, inspect_grouped_trace
+from kernels.tutorial_grouped_gemm import TUTORIAL_KERNEL_AST_SHA256, tutorial_candidate_configs
 from plot_parallel_sweep import parse_run_spec
 from plot_results import _supported_moe_modes
 from utils.benchmark import _whole_ring_count
@@ -21,6 +24,29 @@ from validate_results import _derivable_metrics_valid, _moe_execution_contract_v
 
 
 class CpuMathTests(unittest.TestCase):
+    def test_tutorial_kernel_matches_pinned_upstream_ast(self) -> None:
+        source = Path(__file__).resolve().parents[1] / "kernels" / "tutorial_grouped_gemm.py"
+        tree = ast.parse(source.read_text())
+        node = next(node for node in ast.walk(tree)
+                    if isinstance(node, ast.FunctionDef) and node.name == "grouped_matmul_kernel")
+        node.decorator_list = []
+        # Python 3.12 adds empty type_params fields. Normalize those away so
+        # the upstream checksum also works on supported Python 3.10/3.11.
+        for entry in ast.walk(node):
+            entry._fields = tuple(name for name in entry._fields if name != "type_params")
+        digest = hashlib.sha256(ast.dump(node, include_attributes=False).encode()).hexdigest()
+        self.assertEqual(digest, TUTORIAL_KERNEL_AST_SHA256)
+
+    def test_tutorial_candidates_reject_unsafe_tails_without_padding(self) -> None:
+        self.assertEqual(tutorial_candidate_configs([(17, 33, 65)], 16), ())
+        shapes = [(128, 256, 128), (256, 64, 256)]
+        candidates = tutorial_candidate_configs(shapes, 16)
+        self.assertTrue(candidates)
+        self.assertLessEqual(len(candidates), 8)
+        for cfg in candidates:
+            for m, k, n in shapes:
+                self.assertEqual((m % cfg.block_m, k % cfg.block_k, n % cfg.block_n), (0, 0, 0))
+
     def test_native_grouped_trace_rejects_fallback_and_missing_evidence(self) -> None:
         compute = "cutlass::device_kernel<GemmUniversal<GroupProblemShape<int>>>"
         trace = ["prepare_grouped_gemm_data", compute]

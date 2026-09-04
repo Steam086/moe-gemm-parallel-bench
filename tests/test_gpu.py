@@ -21,13 +21,35 @@ from kernels.torch_grouped_gemm import (
     torch_grouped_mm_unavailable_reason,
     verify_torch_grouped_execution,
 )
-from utils.benchmark import assert_close, time_cuda
+from kernels.tutorial_grouped_gemm import launch_tutorial, prepare_tutorial_workspace, tutorial_candidate_configs
+from utils.benchmark import assert_close, configure_torch_matmul, time_cuda
 
 
 @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "CUDA PyTorch unavailable")
 class TritonCorrectnessTests(unittest.TestCase):
     def setUp(self) -> None:
         torch.manual_seed(7)
+        configure_torch_matmul("ieee")
+
+    def test_project_matches_unmodified_official_grouped_kernel(self) -> None:
+        for shapes in ([(128, 256, 128)] * 3, [(128, 128, 128), (256, 64, 256)]):
+            workspace = build_grouped_workspace(shapes, torch.float16, seed=123)
+            tutorial = prepare_tutorial_workspace(workspace)
+            for config in tutorial_candidate_configs(shapes, workspace.sm_count):
+                for output in workspace.c:
+                    output.fill_(float("nan"))
+                launch_tutorial(tutorial, config)
+                torch.cuda.synchronize()
+                official = [output.clone() for output in workspace.c]
+                for output in workspace.c:
+                    output.fill_(float("nan"))
+                launch_grouped(workspace, config=config, autotune=False)
+                torch.cuda.synchronize()
+                for (a, b, output), expected in zip(workspace.problem_tensors(), official):
+                    reference = (a.float() @ b.float()).half()
+                    torch.testing.assert_close(expected, reference, rtol=2e-3, atol=2e-3)
+                    torch.testing.assert_close(output, reference, rtol=2e-3, atol=2e-3)
+                    torch.testing.assert_close(output, expected, rtol=2e-3, atol=2e-3)
 
     def test_graph_timing_excludes_host_delay_and_visits_cold_ring(self) -> None:
         outputs = [torch.zeros(16, device="cuda") for _ in range(4)]
