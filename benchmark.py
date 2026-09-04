@@ -215,7 +215,7 @@ def main(argv: list[str] | None = None) -> int:
         "triton_autotune": True,
         "standalone_gemm_autotune_scope": "shape-family BLOCK_M/BLOCK_N/BLOCK_K/GROUP_M/num_warps/num_stages",
         "grouped_autotune_scope": "workload-aware BLOCK_M/BLOCK_N/BLOCK_K/GROUP_M/CTA multiplier/num_warps/num_stages",
-        "torch_moe_baseline": "torch.nn.functional.grouped_mm with 2D activations, 3D weights, and int32 offsets",
+        "torch_moe_baseline": "profiler-verified torch.nn.functional.grouped_mm; sequential fallback excluded",
         "w1_semantics": "one-launch packed W13 Gate+Up GEMM with [gate,up] output; activation excluded",
         "cold_autotune": "fixed candidates timed across the complete rotating workspace ring",
         "near_best_threshold": 0.90,

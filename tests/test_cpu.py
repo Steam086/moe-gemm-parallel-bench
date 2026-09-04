@@ -10,6 +10,7 @@ from benchmark import main, parser
 from benchmark_moe import run_moe
 from kernels.grouped_gemm import grouped_candidate_configs
 from kernels.matmul import matmul_candidate_configs
+from kernels.torch_grouped_gemm import TorchGroupedMMUnavailable, inspect_grouped_trace
 from plot_parallel_sweep import parse_run_spec
 from plot_results import _supported_moe_modes
 from utils.benchmark import _whole_ring_count
@@ -20,6 +21,22 @@ from validate_results import _derivable_metrics_valid, _moe_execution_contract_v
 
 
 class CpuMathTests(unittest.TestCase):
+    def test_native_grouped_trace_rejects_fallback_and_missing_evidence(self) -> None:
+        compute = "cutlass::device_kernel<GemmUniversal<GroupProblemShape<int>>>"
+        trace = ["prepare_grouped_gemm_data", compute]
+        result = inspect_grouped_trace(["aten::_grouped_mm"], trace)
+        self.assertEqual(result["launches_per_iteration"], 2)
+        self.assertEqual(result["grouped_compute_launches"], 1)
+        for cpu, gpu in (
+            (["aten::_grouped_mm", "aten::mm"], trace),
+            (["aten::_grouped_mm"], []),
+            (["aten::_grouped_mm"], ["ampere_gemm", "ampere_gemm"]),
+            (["aten::_grouped_mm"], [*trace, "Memcpy DtoH"]),
+            (["aten::_grouped_mm"], [*trace, compute]),
+        ):
+            with self.subTest(cpu=cpu, gpu=gpu), self.assertRaises(TorchGroupedMMUnavailable):
+                inspect_grouped_trace(cpu, gpu)
+
     def test_timing_counts_visit_complete_workspace_rings(self) -> None:
         self.assertEqual(_whole_ring_count(1, 3, 8), 8)
         self.assertEqual(_whole_ring_count(5, 3, 2), 6)
@@ -199,10 +216,14 @@ class CpuMathTests(unittest.TestCase):
         torch_grouped = {
             "mode": "torch",
             "scheduler": "torch_grouped_mm",
-            "launches_per_iteration": "1",
+            "launches_per_iteration": "2",
+            "api_calls_per_iteration": "1",
+            "grouped_compute_launches": "1",
+            "execution_verified": "True",
             "output_preallocated": "False",
         }
         self.assertTrue(_moe_execution_contract_valid(torch_grouped))
+        self.assertFalse(_moe_execution_contract_valid({**torch_grouped, "execution_verified": "False"}))
         self.assertFalse(_moe_execution_contract_valid({**torch_grouped, "scheduler": "sequential_torch_mm"}))
 
     def test_projection_contract_records_gate_up_fusion(self) -> None:

@@ -10,7 +10,12 @@ except ImportError:
 
 from kernels.grouped_gemm import build_fused_gate_up_workspace, build_grouped_workspace, launch_grouped
 from kernels.matmul import last_matmul_config, launch_matmul, select_config
-from kernels.torch_grouped_gemm import build_torch_grouped_workspace, launch_torch_grouped
+from kernels.torch_grouped_gemm import (
+    build_torch_grouped_workspace,
+    launch_torch_grouped,
+    torch_grouped_mm_unavailable_reason,
+    verify_torch_grouped_execution,
+)
 from utils.benchmark import assert_close, time_cuda
 
 
@@ -118,14 +123,27 @@ class TritonCorrectnessTests(unittest.TestCase):
         "public torch grouped_mm unavailable",
     )
     def test_torch_native_grouped_mm_workspace(self) -> None:
-        if torch.cuda.get_device_capability() < (8, 0) or not torch.cuda.is_bf16_supported():
-            self.skipTest("torch grouped_mm BF16 requires SM80+")
+        reason = torch_grouped_mm_unavailable_reason(torch.bfloat16)
+        if reason:
+            self.skipTest(reason)
         shapes = [(17, 13, 31)] * 3
         workspace = build_torch_grouped_workspace(shapes, torch.bfloat16, seed=104)
         self.assertEqual(workspace.offs.tolist(), [17, 34, 51])
         launch_torch_grouped(workspace)
         torch.cuda.synchronize()
         self.assertEqual(workspace.scheduler, "torch_grouped_mm")
+        for a, b, c in workspace.problem_tensors():
+            assert_close(c, a @ b, "bf16")
+
+    def test_native_grouped_trace_and_graph_replay(self) -> None:
+        reason = torch_grouped_mm_unavailable_reason(torch.bfloat16)
+        if reason:
+            self.skipTest(reason)
+        workspace = build_torch_grouped_workspace([(16, 128, 128)] * 3, torch.bfloat16)
+        evidence = verify_torch_grouped_execution(workspace)
+        self.assertEqual(evidence["grouped_compute_launches"], 1)
+        self.assertGreaterEqual(evidence["launches_per_iteration"], 1)
+        time_cuda(lambda _: launch_torch_grouped(workspace), 2, 3)
         for a, b, c in workspace.problem_tensors():
             assert_close(c, a @ b, "bf16")
 

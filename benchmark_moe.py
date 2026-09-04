@@ -21,6 +21,7 @@ from kernels.torch_grouped_gemm import (
     build_torch_grouped_workspace,
     launch_torch_grouped,
     torch_grouped_mm_unavailable_reason,
+    verify_torch_grouped_execution,
 )
 from utils.benchmark import (
     TIMING_METHOD,
@@ -42,7 +43,7 @@ def _estimate(shapes: list[tuple[int, int, int]], item_size: int, mode: str) -> 
         def aligned(value: int) -> int:
             return (value + alignment - 1) // alignment * alignment
 
-        data = sum(item_size * (m * aligned(k) + k * aligned(n) + m * n) for m, k, n in shapes)
+        data = sum(item_size * (m * aligned(k) + k * aligned(n) + m * aligned(n)) for m, k, n in shapes)
         # One int32 cumulative row offset per expert. grouped_mm returns its
         # output, but the output storage is already included in ``data``.
         return data + len(shapes) * 4
@@ -61,7 +62,7 @@ def _base(args, env, projection: str, parallel_type: str, mode: str, m: int, sha
     provider = "torch" if mode == "torch" else "triton"
     operation = "gate_up" if projection == "W1" else "down"
     row = {
-        "schema_version": "1.3",
+        "schema_version": "1.4",
         "timing_method": TIMING_METHOD,
         "run_id": args.run_id,
         "timestamp": args.timestamp,
@@ -102,7 +103,10 @@ def _base(args, env, projection: str, parallel_type: str, mode: str, m: int, sha
         "num_warps": cfg.num_warps,
         "num_stages": cfg.num_stages,
         **metrics,
-        "launches_per_iteration": 1,
+        "api_calls_per_iteration": 1,
+        "launches_per_iteration": "" if mode == "torch" else 1,
+        "grouped_compute_launches": "" if mode == "torch" else 1,
+        "execution_verified": False if mode == "torch" else True,
         "output_preallocated": mode != "torch",
         "autotune_enabled": mode != "torch",
         "autotune_status": "not_run" if mode != "torch" else "not_applicable",
@@ -136,7 +140,7 @@ def _run_case(args, env: dict[str, Any], projection: str, parallel_type: str, mo
     )
     row = _base(args, env, projection, parallel_type, mode, m, shapes[0], len(shapes), total)
     if mode == "torch":
-        unavailable_reason = torch_grouped_mm_unavailable_reason()
+        unavailable_reason = torch_grouped_mm_unavailable_reason(torch_dtype(args.dtype), len(shapes))
         if unavailable_reason:
             row.update(status="skipped", skip_reason=unavailable_reason, error="")
             return row
@@ -206,6 +210,8 @@ def _run_case(args, env: dict[str, Any], projection: str, parallel_type: str, mo
         estimated_memory_bytes=per_workspace * ring,
     )
     try:
+        if mode == "torch":
+            row.update(verify_torch_grouped_execution(workspaces[0]))
         rotating_tuning = None
         if args.cache_mode == "cold" and mode != "torch":
 

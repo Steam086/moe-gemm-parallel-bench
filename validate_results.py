@@ -49,7 +49,10 @@ def _moe_execution_contract_valid(row: dict[str, str]) -> bool:
     if mode == "torch":
         return (
             row.get("scheduler") == "torch_grouped_mm"
-            and row.get("launches_per_iteration") == "1"
+            and row.get("api_calls_per_iteration") == "1"
+            and row.get("grouped_compute_launches") == "1"
+            and _positive_integer(row.get("launches_per_iteration", ""))
+            and _truthy(row.get("execution_verified", ""))
             and _falsey(row.get("output_preallocated", ""))
         )
     if mode != "grouped":

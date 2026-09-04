@@ -45,17 +45,77 @@ class TorchGroupedWorkspace:
             start = end
 
 
-def torch_grouped_mm_unavailable_reason() -> str:
+def torch_grouped_mm_unavailable_reason(dtype=None, problem_count: int = 1) -> str:
     if torch is None:
         return "PyTorch unavailable"
     if not hasattr(torch.nn.functional, "grouped_mm"):
         return "torch.nn.functional.grouped_mm unavailable; PyTorch 2.10 or newer is required"
     if not torch.cuda.is_available():
         return "CUDA unavailable"
+    # PyTorch 2.13 GroupedBlas.cpp uses sequential mm + offs.cpu() outside
+    # this domain. Never equate one Python API call with one grouped kernel.
+    if dtype is not None and dtype != torch.bfloat16:
+        return "native grouped_mm fast path requires BF16; requested dtype would use sequential fallback"
     capability = torch.cuda.get_device_capability(torch.cuda.current_device())
-    if capability < (8, 0):
-        return f"torch grouped_mm requires SM >= 80; selected device is SM {capability[0]}{capability[1]}"
+    if capability[0] not in (9, 10):
+        return "native grouped_mm fast path is only admitted on SM90/SM100-family devices; fallback excluded"
+    if problem_count >= 1024:
+        return "native grouped_mm fast path requires fewer than 1024 groups"
     return ""
+
+
+def inspect_grouped_trace(cpu_ops: Sequence[str], cuda_events: Sequence[str]) -> dict[str, int | bool]:
+    """Fail closed unless a trace proves one CUTLASS grouped compute kernel.
+
+    CUDA events here are device activities, not CUDA API calls. Library metadata
+    preparation kernels count as launches but not as GEMMs. Missing CUPTI data,
+    new unrecognized kernels and sequential fallbacks are all unverified.
+    """
+    if any(name in {"aten::mm", "aten::mm_out", "aten::bmm", "aten::matmul"} for name in cpu_ops):
+        raise TorchGroupedMMUnavailable("profiler detected sequential/batched matmul fallback")
+    if list(cpu_ops).count("aten::_grouped_mm") != 1:
+        raise TorchGroupedMMUnavailable("profiler did not observe exactly one native grouped_mm call")
+    names = [name.lower() for name in cuda_events]
+    if any("memcpy" in name for name in names):
+        raise TorchGroupedMMUnavailable("grouped_mm probe contains a device transfer; fallback excluded")
+    kernels = [name for name in names if "memset" not in name]
+    compute = [
+        name for name in kernels
+        if "cutlass" in name and "gemm" in name and "groupproblemshape" in name
+    ]
+    if len(compute) != 1 or any(
+        name not in compute and "prepare_grouped_gemm_data" not in name for name in kernels
+    ):
+        raise TorchGroupedMMUnavailable("CUDA trace does not prove one supported grouped compute kernel")
+    return {
+        "execution_verified": True,
+        "api_calls_per_iteration": 1,
+        "launches_per_iteration": len(kernels),
+        "grouped_compute_launches": 1,
+    }
+
+
+def verify_torch_grouped_execution(workspace: TorchGroupedWorkspace) -> dict[str, int | bool]:
+    """Profile this exact shape/dtype outside measurement before admitting it."""
+    if torch.profiler.ProfilerActivity.CUDA not in torch.profiler.supported_activities():
+        raise TorchGroupedMMUnavailable("CUDA profiler/CUPTI unavailable; grouped execution cannot be verified")
+    try:
+        launch_torch_grouped(workspace)
+        torch.cuda.synchronize()
+        with torch.profiler.profile(activities=[
+            torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA,
+        ]) as profile:
+            launch_torch_grouped(workspace)
+            torch.cuda.synchronize()
+        events = profile.events()
+        return inspect_grouped_trace(
+            [event.name for event in events if event.device_type == torch.autograd.DeviceType.CPU],
+            [event.name for event in events if event.device_type == torch.autograd.DeviceType.CUDA],
+        )
+    except TorchGroupedMMUnavailable:
+        raise
+    except RuntimeError as exc:
+        raise TorchGroupedMMUnavailable(f"native grouped execution probe failed: {exc}") from exc
 
 
 def build_torch_grouped_workspace(
@@ -65,7 +125,7 @@ def build_torch_grouped_workspace(
     *,
     operation: str = "gemm",
 ) -> TorchGroupedWorkspace:
-    reason = torch_grouped_mm_unavailable_reason()
+    reason = torch_grouped_mm_unavailable_reason(dtype, len(shapes))
     if reason:
         raise TorchGroupedMMUnavailable(reason)
     if not shapes:
@@ -106,7 +166,7 @@ def launch_torch_grouped(workspace: TorchGroupedWorkspace) -> None:
     dispatch lets PyTorch's warmed caching allocator reuse the same output
     storage across benchmark repetitions.
     """
-    reason = torch_grouped_mm_unavailable_reason()
+    reason = torch_grouped_mm_unavailable_reason(workspace.mat_a.dtype, workspace.problem_count)
     if reason:
         raise TorchGroupedMMUnavailable(reason)
     workspace.output = None

@@ -138,7 +138,7 @@ External absolute paths are accepted, but persisted provenance stores only a saf
 ### Scheduling modes
 
 - `grouped`: the MoE Triton provider launches one bounded persistent CTA grid for all local expert GEMMs. W1/W3 packs Gate and Up into a single `2F_local` output and therefore remains one Triton launch, matching vLLM's W13 layout. Equal contiguous shapes use an optimized constexpr fast path; heterogeneous shapes use device-side dimensions and strides. A one-problem group dispatches to the standard Triton matmul kernel instead of retaining grouped-scheduler overhead.
-- `torch`: one native `torch.nn.functional.grouped_mm` call over a 2D expert-sorted activation matrix, 3D expert weights, and cumulative `int32` offsets. It is enabled by default and removable with `--no-torch-baseline`; there is no sequential per-expert fallback. The public API requires PyTorch 2.10+ and CUDA SM80+. Backing storage is row-padded when necessary to satisfy the operator's 16-byte stride alignment without changing logical GEMM dimensions or useful FLOPs.
+- `torch`: one native `torch.nn.functional.grouped_mm` call over a 2D expert-sorted activation matrix, 3D expert weights, and cumulative `int32` offsets. It is enabled by default and removable with `--no-torch-baseline`; there is no sequential per-expert fallback. The public API can silently fall back to serial per-expert `mm` calls, so API availability alone is insufficient. With PyTorch 2.13, this benchmark only admits BF16 on the SM90/SM100 architecture families and fewer than 1024 groups, then profiles the exact workload outside timing to require one CUTLASS grouped compute kernel and no sequential matmul or device transfer. Missing CUPTI traces or unrecognized execution paths produce `status=skipped`. FP16 (the default) and FP32 torch MoE baselines are explicitly skipped; use `--dtype bf16` on a supported device for a native grouped baseline. Dtypes are never silently converted. Backing storage is row-padded when necessary to satisfy the operator's 16-byte stride alignment without changing logical GEMM dimensions or useful FLOPs.
 
 The standalone shape and heatmap experiments still use the single-GEMM Triton kernel; it is not emitted as a MoE scheduling curve.
 
@@ -195,7 +195,7 @@ Down projection contracts, verifies correctness and metrics for `status=ok`
 rows, treats `status=invalid` and `status=error` rows as failures, counts
 `status=skipped` rows, and verifies matched MoE FLOPs. Every successful Triton
 MoE row must record a selected workload-aware grouped configuration, and every
-successful PyTorch MoE row must record one `torch_grouped_mm` launch. Validation
+successful PyTorch MoE row must record verified grouped execution. Schema 1.4 separates `api_calls_per_iteration=1` from the profiler-observed `launches_per_iteration` and `grouped_compute_launches=1`; the library may also launch metadata preparation kernels, which remain part of its timing. Validation
 rejects the removed MoE `single` and sequential torch modes and checks generated
 PNG signatures/counts.
 
